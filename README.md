@@ -70,6 +70,44 @@ pipeline end to end. A document is only ever written to MongoDB once extraction,
 embedding, and consistency checks have all already succeeded in memory — a bad PDF or a
 provider outage never leaves a document stuck in a half-processed state.
 
+### Production-safe PDF extraction (Node/Vercel compatibility)
+
+`extractPdf()` (`lib/pdf/extract.ts`) uses `pdfjs-dist`'s Node ("legacy") build for text-only
+extraction — it never calls `page.render()`, only `page.getTextContent()`.
+
+**Why uploads crashed on Vercel with `ReferenceError: DOMMatrix is not defined`, but not
+locally:** `pdfjs-dist`'s Node build unconditionally evaluates its canvas-*rendering* module code
+(`src/display/canvas.js`) the moment it's imported — including a module-top-level
+`const SCALE_MATRIX = new DOMMatrix();` that runs regardless of whether rendering is ever used.
+`DOMMatrix` isn't a real Node global; `pdfjs-dist` tries to self-polyfill it from its own
+*optional* dependency, the native `@napi-rs/canvas` package, published as a separate binary per
+platform. Locally, npm installed the Windows-native binary, so that self-polyfill silently
+succeeded. On Vercel's Linux serverless runtime, the matching native binary wasn't available at
+runtime — a well-known limitation of native optional dependencies under bundling/dependency
+tracing — so `pdfjs-dist` logged a warning, left `DOMMatrix` undefined, and the later top-level
+`new DOMMatrix()` threw instead, crashing module evaluation before the upload handler ever ran
+(consistent with the reported ~8ms execution duration and zero outgoing requests).
+
+**The fix** (`lib/pdf/node-polyfills.ts`, imported as the *first* import in `extract.ts`): define
+`globalThis.DOMMatrix` ourselves before `pdfjs-dist`'s module body ever runs, using
+[`@thednp/dommatrix`](https://www.npmjs.com/package/@thednp/dommatrix) — a small, dependency-free,
+pure-JS, DOMMatrix-API-compatible class (the maintained successor to the now-deprecated
+`dommatrix` package). Being pure JS rather than a native binary, it behaves identically on every
+platform, eliminating the exact native-optional-dependency gap that caused the crash. ESM
+guarantees static imports evaluate depth-first in source order, so putting the polyfill import
+first in `extract.ts` is what actually guarantees "before" — not a runtime check. The polyfill
+doesn't implement every method of the real browser `DOMMatrix` (e.g. `invertSelf`,
+`preMultiplySelf`) — only enough for `pdfjs-dist`'s module-evaluation-time code to finish loading.
+That's sufficient because this app's extraction path never reaches `pdfjs-dist`'s actual
+canvas-rendering functions (the only place those missing methods would be called) — if a future
+change ever needs real PDF rendering, a real canvas backend (e.g. `@napi-rs/canvas`, explicitly
+installed and verified on the target platform) would be required instead.
+
+`extractPdf()` and everything it depends on remains server-only (`lib/pdf/*` is only imported by
+`lib/services/document-ingestion.service.ts`, in turn only imported by `app/api/upload/route.ts`)
+— verified after this fix that neither `pdfjs-dist` nor `@thednp/dommatrix` appear anywhere in the
+client-side build output.
+
 ### Environment variables
 
 | Variable | Required for | Notes |
@@ -283,8 +321,8 @@ keeps every one of those decisions visible and auditable in a handful of files.
 - MongoDB connections are cached on `global` (`lib/db/mongodb.ts`), reused across warm invocations — unchanged from Day 1.
 - No filesystem writes and no in-memory state required for correctness (the rate limiter is an explicitly best-effort exception, documented above).
 - Streaming uses only standard Web APIs (`ReadableStream`, `Response`), which Vercel's Node.js functions support natively.
-- All server-only dependencies (`mongodb`, `openai`, `@google/genai`, `lib/config/env.ts`, every `lib/services/*` and `lib/providers/*` module) are only ever imported from API routes — verified by inspecting the import graph of every client component/hook (`components/`, `hooks/`, `lib/client/`), none of which reach a server-only module.
-- **Not yet deployed to Vercel** — the above is a readiness review of the code, not a report of an actual deployment.
+- All server-only dependencies (`mongodb`, `openai`, `@google/genai`, `pdfjs-dist`, `lib/config/env.ts`, every `lib/services/*` and `lib/providers/*` module) are only ever imported from API routes — verified by inspecting the import graph of every client component/hook (`components/`, `hooks/`, `lib/client/`), none of which reach a server-only module.
+- **Deployed to Vercel** (`https://docchat-taupe.vercel.app`) — production PDF uploads initially failed there with `ReferenceError: DOMMatrix is not defined` (see "Production-safe PDF extraction" above for the root cause and fix). That fix was verified via a local production build/start of this exact code and an isolated reproduction of the underlying crash mechanism (see the PR/commit for details) — **an actual redeployment to live Vercel infrastructure to confirm the fix was not performed as part of this change**; that step is still owed before considering this closed.
 
 ## Document Library & Multi-Document Selection
 
@@ -492,12 +530,44 @@ hooks/useMultiDocumentUpload.ts's onBatchSettled, never fired per-file)
   → if none succeeded: stop — no conversation is created
   → POST /api/conversations with exactly those IDs (server re-validates them)
   → on success: that document set becomes the active selection, the new (still-empty)
-    conversation becomes the active chat, and it appears at the top of the conversation sidebar
+    conversation becomes the active chat — which switches the UI into "active conversation" mode
+    (see below) — and it appears at the top of the conversation sidebar
   → on failure (e.g. the combined selection exceeds the cumulative size/page limit): the uploaded
     documents are left exactly as they are — still uploaded, visible in the library, selectable
     manually — a clear, non-destructive error explains what happened, and the previously active
     conversation (if any) is completely untouched
 ```
+
+### UI modes: document workspace vs. active conversation
+
+`app/page.tsx` shows exactly one of two modes at a time, derived from a single existing piece of
+state — never a separate flag to keep in sync, and never the conversation's title:
+
+```ts
+isActiveConversationMode(chat.conversationId) // lib/utils/conversation-mode.ts
+```
+
+**Document workspace** (`conversationId === null`) — upload zone, upload queue, document library
+(search/filters/selection), selected-documents summary, and the chat composer once documents are
+selected (to compose a *first* message, which is itself what creates a conversation and flips the
+mode). **Active conversation** (`conversationId !== null`) — just the focused chat: the
+upload/document-selection UI is unmounted entirely, not merely hidden with CSS, so there's nothing
+left behind for a screen reader or keyboard user to stumble into. The conversation sidebar
+(history + "New Conversation") is never conditional on this — it's visible in both modes, on every
+screen size.
+
+A conversation created with no messages yet (`createEmptyConversation`, titled `"New conversation"`)
+counts as fully active the instant it exists — `isActiveConversationMode` takes only a
+`conversationId`, so there's no title parameter for a caller to even accidentally branch on.
+
+"New Conversation" (`ConversationSidebar`'s button → `useChat.startNewChat()`) clears the client's
+`conversationId`/messages — nothing is deleted server-side — which flips the mode back to the
+document workspace; the current document selection is left as-is (matching the existing "New Chat"
+behavior), and every past conversation remains fully intact and reachable from the sidebar.
+Manually selecting existing documents and sending the first message follows the same rule: the mode
+only flips once `POST /api/chat`'s `metadata` event reports a real `conversationId` (the first SSE
+event, arriving before any answer text) — never eagerly on selection alone, so browsing the library
+never creates an orphan conversation.
 
 One upload batch always produces at most one conversation, never one per file — `getBatchResult()`
 (`lib/upload/upload-queue.ts`) splits a batch into its succeeded/failed items only once every item
@@ -652,3 +722,5 @@ started" to represent honestly.
 - No authentication — every conversation and document is visible to any client that can reach the API; access control is out of scope for this assessment.
 - An in-flight upload cannot be cancelled from the UI — `uploadDocumentWithProgress()` supports aborting the underlying `XMLHttpRequest`, but the upload queue only exposes remove/retry for items that aren't currently in flight, to avoid hiding an outstanding request from the list that describes it.
 - `markdownToPlainText()` (used by the copy-answer action) is a small regex-based pass covering the Markdown constructs the assistant actually produces (bold/italic, headings, lists, inline/fenced code) — not a full CommonMark-to-text converter; unusual or nested Markdown could copy with minor formatting artifacts.
+- The `@thednp/dommatrix` polyfill (see "Production-safe PDF extraction") only implements enough of the real `DOMMatrix` API for `pdfjs-dist`'s module-evaluation-time code to load; it does not implement every method (e.g. `invertSelf`, `preMultiplySelf`). This is fine today because extraction never calls `pdfjs-dist`'s canvas-rendering functions — only if real PDF-to-image rendering were added later would a genuine canvas backend become necessary.
+- The DOMMatrix fix was verified via a local production build/start and an isolated reproduction of the exact crash mechanism (see "Production-safe PDF extraction" and the Vercel readiness section) — it has not yet been confirmed against a live redeployment of `https://docchat-taupe.vercel.app`.

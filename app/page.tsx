@@ -14,6 +14,7 @@ import { useDocumentSelection } from "@/hooks/useDocumentSelection";
 import { useConversations } from "@/hooks/useConversations";
 import { useChat } from "@/hooks/useChat";
 import { getConversation, deleteConversation, createConversation, ApiError } from "@/lib/client/api";
+import { isActiveConversationMode } from "@/lib/utils/conversation-mode";
 import type { ChatMessage } from "@/types/chat";
 
 export default function Home() {
@@ -124,6 +125,19 @@ export default function Home() {
 
   const selectedDocuments = library.documents.filter((doc) => selection.selectedIds.includes(doc.id));
   const selectionDiverged = chat.hasDocumentSelectionDiverged(selection.selectedIds);
+  // See lib/utils/conversation-mode.ts — derived from conversationId alone, never the title.
+  // "New Conversation" (handleNewChat) is what clears conversationId and returns to the workspace,
+  // without touching persisted history.
+  const isActiveConversation = isActiveConversationMode(chat.conversationId);
+
+  const activeChat = (
+    <ChatContainer
+      documentNames={selectedDocuments.map((doc) => doc.fileName)}
+      messages={chat.messages}
+      isStreaming={chat.isStreaming}
+      onSend={handleSend}
+    />
+  );
 
   return (
     <div className="flex flex-1 flex-col bg-zinc-50 dark:bg-black lg:flex-row">
@@ -156,63 +170,64 @@ export default function Home() {
             </p>
           ) : null}
 
-          <div className="flex flex-col gap-2">
-            <UploadZone onFilesSelected={upload.addFiles} />
-            <UploadQueueList items={upload.items} onRemove={upload.removeItem} onRetry={upload.retryItem} />
-            {upload.items.length > 0 && !upload.isBusy ? (
-              <button
-                type="button"
-                onClick={upload.clearFinished}
-                className="self-start text-xs font-medium text-zinc-400 transition-colors hover:text-zinc-600 dark:hover:text-zinc-300"
-              >
-                Clear finished uploads
-              </button>
-            ) : null}
-          </div>
-
-          <SelectedDocumentsSummary
-            count={selection.selectedIds.length}
-            documentNames={selectedDocuments.map((doc) => doc.fileName)}
-            totals={selection.totals}
-            rejection={selection.lastRejection}
-            onDismissRejection={selection.dismissRejection}
-          />
-
-          {selectionDiverged ? (
-            <p className="animate-fade-in-up flex items-center gap-1.5 rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-              <Info className="h-4 w-4 shrink-0" />
-              Document selection changed. Sending a message will start a new conversation with the selected documents.
-            </p>
-          ) : null}
-
-          {selection.selectedIds.length > 0 ? (
-            <ChatContainer
-              documentNames={selectedDocuments.map((doc) => doc.fileName)}
-              messages={chat.messages}
-              isStreaming={chat.isStreaming}
-              onSend={handleSend}
-            />
+          {isActiveConversation ? (
+            <div className="animate-fade-in-up flex flex-1 flex-col">{activeChat}</div>
           ) : (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-zinc-200 py-14 text-center text-zinc-400 dark:border-zinc-800 dark:text-zinc-600">
-              <MessageSquare className="h-7 w-7" strokeWidth={1.5} />
-              <p className="text-sm font-medium text-zinc-500 dark:text-zinc-400">Select one or more ready documents to start chatting</p>
-              <p className="max-w-xs text-xs">Answers are grounded strictly in the content of the documents you select.</p>
+            <div className="animate-fade-in-up flex flex-1 flex-col gap-6">
+              <div className="flex flex-col gap-2">
+                <UploadZone onFilesSelected={upload.addFiles} />
+                <UploadQueueList items={upload.items} onRemove={upload.removeItem} onRetry={upload.retryItem} />
+                {upload.items.length > 0 && !upload.isBusy ? (
+                  <button
+                    type="button"
+                    onClick={upload.clearFinished}
+                    className="self-start text-xs font-medium text-zinc-400 transition-colors hover:text-zinc-600 dark:hover:text-zinc-300"
+                  >
+                    Clear finished uploads
+                  </button>
+                ) : null}
+              </div>
+
+              <SelectedDocumentsSummary
+                count={selection.selectedIds.length}
+                documentNames={selectedDocuments.map((doc) => doc.fileName)}
+                totals={selection.totals}
+                rejection={selection.lastRejection}
+                onDismissRejection={selection.dismissRejection}
+              />
+
+              {selectionDiverged ? (
+                <p className="animate-fade-in-up flex items-center gap-1.5 rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                  <Info className="h-4 w-4 shrink-0" />
+                  Document selection changed. Sending a message will start a new conversation with the selected documents.
+                </p>
+              ) : null}
+
+              {selection.selectedIds.length > 0 ? (
+                activeChat
+              ) : (
+                <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-zinc-200 py-14 text-center text-zinc-400 dark:border-zinc-800 dark:text-zinc-600">
+                  <MessageSquare className="h-7 w-7" strokeWidth={1.5} />
+                  <p className="text-sm font-medium text-zinc-500 dark:text-zinc-400">Select one or more ready documents to start chatting</p>
+                  <p className="max-w-xs text-xs">Answers are grounded strictly in the content of the documents you select.</p>
+                </div>
+              )}
+
+              <DocumentLibrary
+                documents={library.documents}
+                isLoading={library.isLoading}
+                search={library.search}
+                onSearchChange={library.setSearch}
+                statusFilter={library.statusFilter}
+                onStatusFilterChange={library.setStatusFilter}
+                selectedIds={selection.selectedIds}
+                canSelect={selection.canSelect}
+                onToggle={selection.toggle}
+                hasMore={library.hasMore}
+                onLoadMore={library.loadMore}
+              />
             </div>
           )}
-
-          <DocumentLibrary
-            documents={library.documents}
-            isLoading={library.isLoading}
-            search={library.search}
-            onSearchChange={library.setSearch}
-            statusFilter={library.statusFilter}
-            onStatusFilterChange={library.setStatusFilter}
-            selectedIds={selection.selectedIds}
-            canSelect={selection.canSelect}
-            onToggle={selection.toggle}
-            hasMore={library.hasMore}
-            onLoadMore={library.loadMore}
-          />
         </div>
       </div>
     </div>

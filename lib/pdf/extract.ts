@@ -1,3 +1,9 @@
+// MUST be the first import in this file: it synchronously sets globalThis.DOMMatrix as its
+// module body runs, and ESM evaluates static imports depth-first in source order — so this
+// guarantees the polyfill is in place before pdfjs-dist's own module body (imported next) runs
+// its module-top-level `new DOMMatrix()` call. See that module's doc comment for the full story
+// (root cause: a Vercel-only crash, "ReferenceError: DOMMatrix is not defined").
+import "@/lib/pdf/node-polyfills";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
 import * as pdfjsWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs";
