@@ -60,3 +60,29 @@ export function getProviderEnv(): ProviderEnv {
 
   return parsed.data;
 }
+
+export function hasOpenAiApiKey(): boolean {
+  return Boolean(getProviderEnv().OPENAI_API_KEY);
+}
+
+export function hasGeminiApiKey(): boolean {
+  return Boolean(getProviderEnv().GEMINI_API_KEY);
+}
+
+/** Throws a plain, developer-facing Error if OPENAI_API_KEY is unset. Only call this when OpenAI is actually about to be used. */
+export function requireOpenAiApiKey(): string {
+  const { OPENAI_API_KEY } = getProviderEnv();
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is not configured.");
+  }
+  return OPENAI_API_KEY;
+}
+
+/** Throws a plain, developer-facing Error if GEMINI_API_KEY is unset. Only call this when Gemini is actually about to be used. */
+export function requireGeminiApiKey(): string {
+  const { GEMINI_API_KEY } = getProviderEnv();
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not configured.");
+  }
+  return GEMINI_API_KEY;
+}

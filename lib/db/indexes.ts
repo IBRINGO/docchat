@@ -15,11 +15,13 @@ export async function initializeDatabaseIndexes(): Promise<void> {
 
   await Promise.all([
     documents.createIndex({ createdAt: -1 }, { name: "documents_createdAt" }),
+    documents.createIndex({ status: 1 }, { name: "documents_status" }),
     chunks.createIndex({ documentId: 1 }, { name: "chunks_documentId" }),
     chunks.createIndex(
       { documentId: 1, chunkIndex: 1 },
       { name: "chunks_documentId_chunkIndex", unique: true },
     ),
+    chunks.createIndex({ documentId: 1, pageNumber: 1 }, { name: "chunks_documentId_pageNumber" }),
   ]);
 
   logger.info("database_indexes_initialized");

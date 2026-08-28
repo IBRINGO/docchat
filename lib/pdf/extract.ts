@@ -1,8 +1,27 @@
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import * as pdfjsWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import { logger } from "@/lib/utils/logger";
 import { pdfInvalidInputError, pdfTextNotExtractableError, pdfUnreadableError } from "@/lib/pdf/errors";
 import type { ExtractedDocument, ExtractedPage } from "@/lib/pdf/types";
+
+declare global {
+  var pdfjsWorker: typeof import("pdfjs-dist/legacy/build/pdf.worker.mjs") | undefined;
+}
+
+/**
+ * pdf.js has no real Worker thread to hand off to in Node, so it falls back
+ * to dynamically importing its own worker module by a path relative to
+ * wherever pdf.mjs itself ended up ("./pdf.worker.mjs"). That's fine
+ * unbundled, but Next.js's bundler (Turbopack) relocates pdf.mjs into
+ * .next/.../chunks/ without carrying pdf.worker.mjs along, so the relative
+ * import 404s ("Setting up fake worker failed"). pdf.js checks
+ * `globalThis.pdfjsWorker` before attempting that dynamic import, so
+ * statically importing the worker module ourselves — which the bundler
+ * resolves correctly, since it's a static import, not a runtime path —
+ * and registering it here skips the broken lookup entirely.
+ */
+globalThis.pdfjsWorker = pdfjsWorker;
 
 // pdf.js does not export TextItem/TextMarkedContent from the package root, so
 // the item type is derived structurally from the public PDFPageProxy API.
@@ -39,6 +58,7 @@ async function loadDocument(buffer: Buffer): Promise<PDFDocumentProxy> {
   try {
     return await loadingTask.promise;
   } catch (error) {
+    logger.error("pdf_extraction_failed", { reason: "unreadable", error });
     throw pdfUnreadableError(error);
   }
 }
