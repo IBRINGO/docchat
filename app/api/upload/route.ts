@@ -4,6 +4,9 @@ import { logger } from "@/lib/utils/logger";
 import { fileMissingError, validateUploadedFile } from "@/lib/validation/upload.schema";
 import { DocumentIngestionService } from "@/lib/services/document-ingestion.service";
 
+// MongoDB, OpenAI, and Gemini SDKs are all Node-only — this route cannot run on the Edge runtime.
+export const runtime = "nodejs";
+
 export async function POST(request: Request): Promise<Response> {
   try {
     const formData = await request.formData();

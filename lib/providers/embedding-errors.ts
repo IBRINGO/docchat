@@ -40,3 +40,11 @@ export function embeddingConfigurationMismatchError(reason: string): AppError {
     status: 500,
   });
 }
+
+export function unsupportedEmbeddingConfigurationError(provider: string): AppError {
+  return new AppError({
+    code: "UNSUPPORTED_EMBEDDING_CONFIGURATION",
+    message: `Unsupported embedding provider: ${provider}`,
+    status: 422,
+  });
+}

@@ -86,3 +86,26 @@ export function requireGeminiApiKey(): string {
   }
   return GEMINI_API_KEY;
 }
+
+const vectorSearchEnvSchema = z.object({
+  MONGODB_VECTOR_INDEX: z.string().min(1).default("chunks_vector_index"),
+  MONGODB_VECTOR_NUM_CANDIDATES: z.coerce.number().int().positive().optional(),
+});
+
+export type VectorSearchEnv = z.infer<typeof vectorSearchEnvSchema>;
+
+let cachedVectorSearchEnv: VectorSearchEnv | undefined;
+
+/** Validates the optional MongoDB Atlas Vector Search configuration (index name, candidate pool size). */
+export function getVectorSearchEnv(): VectorSearchEnv {
+  assertServer();
+  if (cachedVectorSearchEnv) return cachedVectorSearchEnv;
+
+  const parsed = vectorSearchEnvSchema.safeParse(process.env);
+  if (!parsed.success) {
+    throw new Error(`Invalid vector search environment configuration: ${formatIssues(parsed.error)}`);
+  }
+
+  cachedVectorSearchEnv = parsed.data;
+  return cachedVectorSearchEnv;
+}

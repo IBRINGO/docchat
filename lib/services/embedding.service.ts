@@ -1,13 +1,16 @@
-import OpenAI from "openai";
-import { ApiError as GeminiApiError } from "@google/genai";
 import { hasGeminiApiKey, hasOpenAiApiKey } from "@/lib/config/env";
 import { logger } from "@/lib/utils/logger";
-import { isAppError } from "@/lib/utils/errors";
-import { aiProviderNotConfiguredError, embeddingInvalidInputError } from "@/lib/providers/embedding-errors";
+import { isRecoverableProviderError } from "@/lib/providers/recoverable-provider-error";
+import {
+  aiProviderNotConfiguredError,
+  embeddingConfigurationMismatchError,
+  embeddingInvalidInputError,
+  unsupportedEmbeddingConfigurationError,
+} from "@/lib/providers/embedding-errors";
 import { OpenAiEmbeddingProvider } from "@/lib/providers/openai-embedding.provider";
 import { GeminiEmbeddingProvider } from "@/lib/providers/gemini-embedding.provider";
 import { validateEmbeddingBatchConsistency } from "@/lib/providers/embedding.provider";
-import type { EmbeddingProvider, EmbeddingResult } from "@/lib/providers/embedding.provider";
+import type { EmbeddingConfiguration, EmbeddingProvider, EmbeddingResult } from "@/lib/providers/embedding.provider";
 
 function isProviderConfigured(provider: EmbeddingProvider): boolean {
   if (provider.name === "openai") return hasOpenAiApiKey();
@@ -25,25 +28,21 @@ function validateInputs(inputs: string[]): void {
 }
 
 /**
- * Recoverable = worth retrying against the fallback provider: rate limiting,
- * transient network failures, or a provider-side 5xx. NOT recoverable = bad
- * input, an unconfigured/invalid key, or any other 4xx — those are local
- * problems that a different provider won't fix and that fallback would only
- * mask.
+ * Constructs a provider instance pinned to an exact model (and, for Gemini,
+ * output dimensionality) rather than provider defaults. Used only for
+ * configuration-aware embedding, where the caller needs the SAME embedding
+ * space a document was originally embedded in — never "whichever provider
+ * happens to be primary right now".
  */
-function isRecoverableProviderError(error: unknown): boolean {
-  const cause = isAppError(error) ? error.cause : error;
-
-  if (cause instanceof OpenAI.APIConnectionError) return true;
-  if (cause instanceof OpenAI.APIError) {
-    return cause.status === 429 || (typeof cause.status === "number" && cause.status >= 500);
+function createProviderForConfiguration(configuration: EmbeddingConfiguration): EmbeddingProvider {
+  switch (configuration.provider) {
+    case "openai":
+      return new OpenAiEmbeddingProvider(configuration.model);
+    case "gemini":
+      return new GeminiEmbeddingProvider(configuration.model, configuration.dimensions);
+    default:
+      throw unsupportedEmbeddingConfigurationError(configuration.provider);
   }
-
-  if (cause instanceof GeminiApiError) {
-    return cause.status === 429 || cause.status >= 500;
-  }
-
-  return false;
 }
 
 /**
@@ -60,6 +59,34 @@ export class EmbeddingService {
 
   async generateEmbedding(input: string): Promise<EmbeddingResult> {
     const [result] = await this.generateEmbeddings([input]);
+    return result;
+  }
+
+  /**
+   * Generates a single embedding using an EXACT provider/model/dimensions —
+   * no fallback. For retrieval, where the query embedding must land in the
+   * same vector space a specific document was already embedded in, silently
+   * falling back to a different provider would produce a vector that's
+   * incompatible with that document's stored chunks.
+   */
+  async generateEmbeddingForConfiguration(input: string, configuration: EmbeddingConfiguration): Promise<EmbeddingResult> {
+    validateInputs([input]);
+
+    const available = configuration.provider === "openai" ? hasOpenAiApiKey() : hasGeminiApiKey();
+    if (!available) {
+      throw aiProviderNotConfiguredError(configuration.provider);
+    }
+
+    const provider = createProviderForConfiguration(configuration);
+    const result = await provider.generateEmbedding(input);
+
+    if (result.provider !== configuration.provider || result.model !== configuration.model || result.dimensions !== configuration.dimensions) {
+      throw embeddingConfigurationMismatchError(
+        `expected provider=${configuration.provider} model=${configuration.model} dimensions=${configuration.dimensions}, ` +
+          `got provider=${result.provider} model=${result.model} dimensions=${result.dimensions}`,
+      );
+    }
+
     return result;
   }
 
