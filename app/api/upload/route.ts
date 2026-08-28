@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { isAppError } from "@/lib/utils/errors";
-import { logger } from "@/lib/utils/logger";
+import { errorResponse } from "@/lib/utils/api-response";
 import { fileMissingError, validateUploadedFile } from "@/lib/validation/upload.schema";
 import { DocumentIngestionService } from "@/lib/services/document-ingestion.service";
 
@@ -46,22 +45,6 @@ export async function POST(request: Request): Promise<Response> {
       },
     });
   } catch (error) {
-    return toErrorResponse(error);
+    return errorResponse(error, "upload_request_failed");
   }
-}
-
-function toErrorResponse(error: unknown): Response {
-  if (isAppError(error)) {
-    logger.warn("upload_request_failed", { code: error.code, status: error.status });
-    return NextResponse.json(
-      { success: false, error: { code: error.code, message: error.message } },
-      { status: error.status },
-    );
-  }
-
-  logger.error("upload_request_failed", { error });
-  return NextResponse.json(
-    { success: false, error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred." } },
-    { status: 500 },
-  );
 }

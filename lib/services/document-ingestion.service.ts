@@ -2,7 +2,8 @@ import { ObjectId, type Collection } from "mongodb";
 import { getChunksCollection, getDocumentsCollection } from "@/lib/db/collections";
 import { extractPdf } from "@/lib/pdf/extract";
 import { normalizeExtractedText } from "@/lib/pdf/normalize";
-import { pdfTextNotExtractableError } from "@/lib/pdf/errors";
+import { pdfTextNotExtractableError, pdfTooManyPagesError } from "@/lib/pdf/errors";
+import { MAX_DOCUMENT_PAGE_COUNT } from "@/lib/config/document-limits";
 import { chunkDocument } from "@/lib/rag/chunker";
 import { getEmbeddingService, type EmbeddingService } from "@/lib/services/embedding.service";
 import { toEmbeddingConfiguration, validateEmbeddingBatchConsistency } from "@/lib/providers/embedding.provider";
@@ -69,6 +70,15 @@ export class DocumentIngestionService {
       pageCount: extracted.pageCount,
       extractedPageCount: extracted.pages.length,
     });
+
+    if (extracted.pageCount > MAX_DOCUMENT_PAGE_COUNT) {
+      logger.warn("document_ingestion_rejected", {
+        reason: "too_many_pages",
+        pageCount: extracted.pageCount,
+        maxPages: MAX_DOCUMENT_PAGE_COUNT,
+      });
+      throw pdfTooManyPagesError(extracted.pageCount, MAX_DOCUMENT_PAGE_COUNT);
+    }
 
     const normalizedPages = extracted.pages.map((page) => ({
       ...page,

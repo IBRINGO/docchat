@@ -1,9 +1,9 @@
-import { NextResponse } from "next/server";
-import { isAppError, AppError } from "@/lib/utils/errors";
+import { AppError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
+import { errorResponse, rateLimitedResponse } from "@/lib/utils/api-response";
 import { validateChatRequest } from "@/lib/validation/chat.schema";
 import { ChatService, type ChatStreamEvent, type PreparedChat } from "@/lib/services/chat.service";
-import { checkRateLimit } from "@/lib/utils/rate-limit";
+import { checkRateLimit, clientKeyFromRequest } from "@/lib/utils/rate-limit";
 
 // MongoDB, OpenAI, and Gemini SDKs are all Node-only — this route cannot run on the Edge runtime.
 export const runtime = "nodejs";
@@ -20,33 +20,14 @@ function malformedRequestBodyError(): AppError {
   });
 }
 
-function rateLimitedError(): AppError {
-  return new AppError({
-    code: "RATE_LIMITED",
-    message: "Too many requests. Please try again shortly.",
-    status: 429,
-  });
-}
-
-/** No per-user auth exists yet, so requests are keyed by the client's forwarded IP — falls back to a shared bucket if absent (e.g. local dev without a proxy). */
-function clientKey(request: Request): string {
-  const forwardedFor = request.headers.get("x-forwarded-for");
-  return forwardedFor?.split(",")[0]?.trim() || "unknown";
-}
-
 function sseEvent(event: ChatStreamEvent): string {
   return `event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`;
 }
 
 export async function POST(request: Request): Promise<Response> {
-  const rateLimit = checkRateLimit(`chat:${clientKey(request)}`, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_MS);
+  const rateLimit = checkRateLimit(`chat:${clientKeyFromRequest(request)}`, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_MS);
   if (!rateLimit.allowed) {
-    const error = rateLimitedError();
-    logger.warn("chat_request_failed", { code: error.code, status: error.status });
-    return NextResponse.json(
-      { success: false, error: { code: error.code, message: error.message } },
-      { status: error.status, headers: { "Retry-After": String(rateLimit.retryAfterSeconds) } },
-    );
+    return rateLimitedResponse(rateLimit.retryAfterSeconds, "chat_request_failed");
   }
 
   const chatService = new ChatService();
@@ -59,7 +40,7 @@ export async function POST(request: Request): Promise<Response> {
     const chatRequest = validateChatRequest(payload);
     prepared = await chatService.prepare(chatRequest);
   } catch (error) {
-    return toErrorResponse(error);
+    return errorResponse(error, "chat_request_failed");
   }
 
   const encoder = new TextEncoder();
@@ -92,20 +73,4 @@ export async function POST(request: Request): Promise<Response> {
       "X-Accel-Buffering": "no",
     },
   });
-}
-
-function toErrorResponse(error: unknown): Response {
-  if (isAppError(error)) {
-    logger.warn("chat_request_failed", { code: error.code, status: error.status });
-    return NextResponse.json(
-      { success: false, error: { code: error.code, message: error.message } },
-      { status: error.status },
-    );
-  }
-
-  logger.error("chat_request_failed", { error });
-  return NextResponse.json(
-    { success: false, error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred." } },
-    { status: 500 },
-  );
 }

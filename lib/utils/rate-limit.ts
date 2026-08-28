@@ -38,3 +38,9 @@ export function checkRateLimit(key: string, limit: number, windowMs: number): Ra
   bucket.count += 1;
   return { allowed: true, retryAfterSeconds: 0 };
 }
+
+/** No per-user auth exists yet, so requests are keyed by the client's forwarded IP — falls back to a shared bucket if absent (e.g. local dev without a proxy). Shared by every rate-limited route. */
+export function clientKeyFromRequest(request: Request): string {
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  return forwardedFor?.split(",")[0]?.trim() || "unknown";
+}

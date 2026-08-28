@@ -30,12 +30,12 @@ function fakeRow(overrides: Partial<FakeRow> = {}): FakeRow {
 }
 
 describe("vectorSearchChunks", () => {
-  it("scopes the query to documentId, embeddingProvider, and embeddingModel", async () => {
+  it("scopes the query to documentIds, embeddingProvider, and embeddingModel", async () => {
     const documentId = new ObjectId();
     const { collection, aggregate } = fakeChunksCollection([]);
 
     await vectorSearchChunks(collection, {
-      documentId,
+      documentIds: [documentId],
       embeddingProvider: "openai",
       embeddingModel: "text-embedding-3-small",
       queryVector: [0.1, 0.2, 0.3],
@@ -54,16 +54,34 @@ describe("vectorSearchChunks", () => {
     expect(vectorSearchStage.path).toBe("embedding");
     expect(vectorSearchStage.queryVector).toEqual([0.1, 0.2, 0.3]);
     expect(vectorSearchStage.limit).toBe(5);
-    expect(vectorSearchStage.filter.$and).toContainEqual({ documentId });
+    expect(vectorSearchStage.filter.$and).toContainEqual({ documentId: { $in: [documentId] } });
     expect(vectorSearchStage.filter.$and).toContainEqual({ embeddingProvider: "openai" });
     expect(vectorSearchStage.filter.$and).toContainEqual({ embeddingModel: "text-embedding-3-small" });
+  });
+
+  it("scopes the query to multiple document IDs sharing one embedding configuration", async () => {
+    const documentA = new ObjectId();
+    const documentB = new ObjectId();
+    const { collection, aggregate } = fakeChunksCollection([]);
+
+    await vectorSearchChunks(collection, {
+      documentIds: [documentA, documentB],
+      embeddingProvider: "gemini",
+      embeddingModel: "gemini-embedding-2",
+      queryVector: [0.1],
+      limit: 5,
+    });
+
+    const pipeline = aggregate.mock.calls[0][0] as Array<Record<string, unknown>>;
+    const vectorSearchStage = pipeline[0].$vectorSearch as { filter: { $and: Array<Record<string, unknown>> } };
+    expect(vectorSearchStage.filter.$and).toContainEqual({ documentId: { $in: [documentA, documentB] } });
   });
 
   it("defaults numCandidates when none is provided", async () => {
     const { collection, aggregate } = fakeChunksCollection([]);
 
     await vectorSearchChunks(collection, {
-      documentId: new ObjectId(),
+      documentIds: [new ObjectId()],
       embeddingProvider: "gemini",
       embeddingModel: "gemini-embedding-2",
       queryVector: [0.1],
@@ -79,7 +97,7 @@ describe("vectorSearchChunks", () => {
     const { collection, aggregate } = fakeChunksCollection([]);
 
     await vectorSearchChunks(collection, {
-      documentId: new ObjectId(),
+      documentIds: [new ObjectId()],
       embeddingProvider: "gemini",
       embeddingModel: "gemini-embedding-2",
       queryVector: [0.1],
@@ -97,7 +115,7 @@ describe("vectorSearchChunks", () => {
     const { collection } = fakeChunksCollection([row]);
 
     const hits = await vectorSearchChunks(collection, {
-      documentId: row.documentId,
+      documentIds: [row.documentId],
       embeddingProvider: "openai",
       embeddingModel: "text-embedding-3-small",
       queryVector: [0.1],
@@ -126,7 +144,7 @@ describe("vectorSearchChunks", () => {
 
     await expect(
       vectorSearchChunks(collection, {
-        documentId: new ObjectId(),
+        documentIds: [new ObjectId()],
         embeddingProvider: "openai",
         embeddingModel: "text-embedding-3-small",
         queryVector: [0.1],

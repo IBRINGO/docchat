@@ -214,6 +214,26 @@ describe("DocumentIngestionService", () => {
     });
   });
 
+  it("rejects a document exceeding the page limit before embedding or persisting anything", async () => {
+    mockedExtractPdf.mockResolvedValue({
+      pageCount: 51,
+      pages: Array.from({ length: 51 }, (_, i) => ({ pageNumber: i + 1, text: `Page ${i + 1} content.` })),
+    });
+
+    const embeddingService = fakeEmbeddingGenerator();
+    const documents = fakeDocumentsCollection();
+    const chunks = fakeChunksCollection();
+    const service = new DocumentIngestionService(embeddingService, async () => documents, async () => chunks);
+
+    await expect(
+      service.ingest({ fileName: "big.pdf", mimeType: "application/pdf", fileSize: 1234, buffer: Buffer.from("x") }),
+    ).rejects.toSatisfy((error: unknown) => isAppError(error) && error.code === "PDF_TOO_MANY_PAGES");
+
+    expect(embeddingService.generateEmbeddings).not.toHaveBeenCalled();
+    expect(documents.insertOne).not.toHaveBeenCalled();
+    expect(chunks.insertMany).not.toHaveBeenCalled();
+  });
+
   it("never touches the database when extraction fails", async () => {
     const { pdfTextNotExtractableError } = await import("@/lib/pdf/errors");
     mockedExtractPdf.mockRejectedValue(pdfTextNotExtractableError());

@@ -5,6 +5,8 @@ import type { RetrievedChunk } from "@/lib/rag/retrieval.types";
 function chunk(overrides: Partial<RetrievedChunk> = {}): RetrievedChunk {
   return {
     id: "chunk-1",
+    documentId: "doc-1",
+    documentName: "Project_Report.pdf",
     content: "The project objective is to build a document chat assistant.",
     pageNumber: 3,
     chunkIndex: 0,
@@ -14,10 +16,11 @@ function chunk(overrides: Partial<RetrievedChunk> = {}): RetrievedChunk {
 }
 
 describe("buildRagPrompt", () => {
-  it("includes the retrieved chunk content and page number in the system prompt", () => {
+  it("includes the retrieved chunk content, document name, and page number in the system prompt", () => {
     const { systemPrompt } = buildRagPrompt("What is the objective?", [chunk()]);
 
     expect(systemPrompt).toContain("The project objective is to build a document chat assistant.");
+    expect(systemPrompt).toContain("Document: Project_Report.pdf");
     expect(systemPrompt).toContain("Page: 3");
   });
 
@@ -41,6 +44,18 @@ describe("buildRagPrompt", () => {
     expect(systemPrompt).toContain("First excerpt content.");
     expect(systemPrompt).toContain("SOURCE [2]");
     expect(systemPrompt).toContain("Second excerpt content.");
+  });
+
+  it("clearly identifies which document each source came from when multiple documents are involved", () => {
+    const chunks = [
+      chunk({ id: "a", documentId: "doc-a", documentName: "Project_Specification.pdf", content: "Spec excerpt.", pageNumber: 4 }),
+      chunk({ id: "b", documentId: "doc-b", documentName: "Architecture.pdf", content: "Architecture excerpt.", pageNumber: 2 }),
+    ];
+    const { systemPrompt } = buildRagPrompt("question", chunks);
+
+    expect(systemPrompt).toContain("Document: Project_Specification.pdf");
+    expect(systemPrompt).toContain("Document: Architecture.pdf");
+    expect(systemPrompt.toLowerCase()).toContain("mention which document");
   });
 
   it("passes the raw question through as the user prompt, unmodified", () => {

@@ -1,4 +1,6 @@
 import type { RetrievedChunk } from "@/lib/rag/retrieval.types";
+import type { DocumentListPagination, DocumentSummary } from "@/lib/services/document-list.service";
+import type { ConversationListPagination, ConversationSummary, MessageView } from "@/lib/services/conversation-list.service";
 import { parseSseBuffer } from "@/lib/client/sse";
 
 export class ApiError extends Error {
@@ -45,19 +47,125 @@ export async function uploadDocument(file: File): Promise<UploadedDocument> {
   return (payload as { document: UploadedDocument }).document;
 }
 
+export interface ListDocumentsParams {
+  q?: string;
+  status?: "processing" | "ready" | "failed";
+  page?: number;
+  limit?: number;
+}
+
+export interface ListDocumentsResult {
+  documents: DocumentSummary[];
+  pagination: DocumentListPagination;
+}
+
+/** Fetches GET /api/documents with optional search/status/pagination params. */
+export async function listDocuments(params: ListDocumentsParams = {}): Promise<ListDocumentsResult> {
+  const searchParams = new URLSearchParams();
+  if (params.q) searchParams.set("q", params.q);
+  if (params.status) searchParams.set("status", params.status);
+  if (params.page) searchParams.set("page", String(params.page));
+  if (params.limit) searchParams.set("limit", String(params.limit));
+
+  const query = searchParams.toString();
+  const response = await fetch(`/api/documents${query ? `?${query}` : ""}`);
+  const payload: unknown = await response.json().catch(() => null);
+
+  if (!response.ok || isErrorPayload(payload)) {
+    const error = isErrorPayload(payload) ? payload.error : undefined;
+    throw new ApiError(error?.code ?? "UNKNOWN_ERROR", error?.message ?? "The document list could not be loaded.");
+  }
+
+  return payload as ListDocumentsResult;
+}
+
+export interface ListConversationsResult {
+  conversations: ConversationSummary[];
+  pagination: ConversationListPagination;
+}
+
+/** Fetches GET /api/conversations, newest activity first. */
+export async function listConversations(params: { page?: number; limit?: number } = {}): Promise<ListConversationsResult> {
+  const searchParams = new URLSearchParams();
+  if (params.page) searchParams.set("page", String(params.page));
+  if (params.limit) searchParams.set("limit", String(params.limit));
+
+  const query = searchParams.toString();
+  const response = await fetch(`/api/conversations${query ? `?${query}` : ""}`);
+  const payload: unknown = await response.json().catch(() => null);
+
+  if (!response.ok || isErrorPayload(payload)) {
+    const error = isErrorPayload(payload) ? payload.error : undefined;
+    throw new ApiError(error?.code ?? "UNKNOWN_ERROR", error?.message ?? "The conversation history could not be loaded.");
+  }
+
+  return payload as ListConversationsResult;
+}
+
+export interface ConversationDetailView {
+  id: string;
+  title: string;
+  documentIds: string[];
+  documentNames: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GetConversationResult {
+  conversation: ConversationDetailView;
+  messages: MessageView[];
+}
+
+/** Fetches GET /api/conversations/:id — full metadata plus ordered message history. */
+export async function getConversation(conversationId: string): Promise<GetConversationResult> {
+  const response = await fetch(`/api/conversations/${conversationId}`);
+  const payload: unknown = await response.json().catch(() => null);
+
+  if (!response.ok || isErrorPayload(payload)) {
+    const error = isErrorPayload(payload) ? payload.error : undefined;
+    throw new ApiError(error?.code ?? "UNKNOWN_ERROR", error?.message ?? "The conversation could not be loaded.");
+  }
+
+  return payload as GetConversationResult;
+}
+
+/** Deletes a conversation and its messages via DELETE /api/conversations/:id. */
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await fetch(`/api/conversations/${conversationId}`, { method: "DELETE" });
+  const payload: unknown = await response.json().catch(() => null);
+
+  if (!response.ok || isErrorPayload(payload)) {
+    const error = isErrorPayload(payload) ? payload.error : undefined;
+    throw new ApiError(error?.code ?? "UNKNOWN_ERROR", error?.message ?? "The conversation could not be deleted.");
+  }
+}
+
+export interface ChatMetadata {
+  conversationId: string;
+  documentIds: string[];
+  sources: RetrievedChunk[];
+}
+
 export interface ChatStreamCallbacks {
-  onMetadata?: (sources: RetrievedChunk[]) => void;
+  onMetadata?: (metadata: ChatMetadata) => void;
   onDelta?: (text: string) => void;
   onDone?: () => void;
   onError?: (message: string) => void;
 }
 
+export interface StreamChatRequest {
+  documentIds: string[];
+  message: string;
+  /** Omit to start a new conversation. */
+  conversationId?: string;
+}
+
 /** Sends a question to POST /api/chat and streams the SSE response, invoking the matching callback per event. Resolves once the stream ends (on "done" or after the response body closes). */
-export async function streamChatResponse(documentId: string, message: string, callbacks: ChatStreamCallbacks): Promise<void> {
+export async function streamChatResponse(request: StreamChatRequest, callbacks: ChatStreamCallbacks): Promise<void> {
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ documentId, message }),
+    body: JSON.stringify(request),
   });
 
   if (!response.ok) {
@@ -85,8 +193,10 @@ export async function streamChatResponse(documentId: string, message: string, ca
     for (const event of parsed.events) {
       switch (event.type) {
         case "metadata": {
-          const data = event.data as { sources?: RetrievedChunk[] };
-          callbacks.onMetadata?.(data.sources ?? []);
+          const data = event.data as { conversationId?: string; documentIds?: string[]; sources?: RetrievedChunk[] };
+          if (data.conversationId) {
+            callbacks.onMetadata?.({ conversationId: data.conversationId, documentIds: data.documentIds ?? [], sources: data.sources ?? [] });
+          }
           break;
         }
         case "delta": {

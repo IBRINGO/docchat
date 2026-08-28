@@ -39,10 +39,11 @@ export function SourceList({ sources }: SourceListProps) {
               key={source.id}
               className="rounded-lg border border-zinc-100 bg-zinc-50 px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900"
             >
-              <div className="mb-1 flex items-center justify-between text-zinc-500 dark:text-zinc-400">
-                <span>{source.pageNumber !== null ? `Page ${source.pageNumber}` : "Page unknown"}</span>
-                <span>Similarity: {source.score.toFixed(2)}</span>
+              <div className="mb-1 flex items-center justify-between gap-2 text-zinc-500 dark:text-zinc-400">
+                <span className="truncate font-medium text-zinc-700 dark:text-zinc-300">{source.documentName}</span>
+                <span className="shrink-0">Similarity: {source.score.toFixed(2)}</span>
               </div>
+              <div className="mb-1 text-zinc-500 dark:text-zinc-400">{source.pageNumber !== null ? `Page ${source.pageNumber}` : "Page unknown"}</div>
               <p className="text-zinc-700 dark:text-zinc-300">&ldquo;{truncate(source.content)}&rdquo;</p>
             </li>
           ))}

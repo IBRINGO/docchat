@@ -12,7 +12,8 @@ export const DEFAULT_VECTOR_SEARCH_NUM_CANDIDATES = 50;
 export type ChunksAggregateCollection = Pick<Collection<Chunk>, "aggregate">;
 
 export interface VectorSearchParams {
-  documentId: ObjectId;
+  /** One or more documents, always sharing the SAME embeddingProvider/embeddingModel — callers group by embedding configuration before calling this (see RetrievalService). */
+  documentIds: ObjectId[];
   embeddingProvider: EmbeddingProvider;
   embeddingModel: string;
   queryVector: number[];
@@ -51,13 +52,15 @@ function vectorSearchFailedError(cause: unknown): AppError {
 
 /**
  * Runs an Atlas `$vectorSearch` query against the chunks collection, scoped
- * to one document and one exact embedding configuration. The `filter` clause
- * is what prevents cross-document and cross-embedding-space contamination —
- * without it, a query vector could match chunks from an unrelated document,
- * or (worse) chunks embedded by a different provider/model, where the vector
- * space itself isn't comparable. Requires the Atlas index to define
- * `documentId`, `embeddingProvider`, and `embeddingModel` as filter fields
- * (see README).
+ * to a set of documents that ALL share one exact embedding configuration —
+ * callers (RetrievalService) are responsible for grouping documents by
+ * embeddingProvider/embeddingModel/embeddingDimensions before calling this,
+ * since vectors from different providers/models are never comparable even
+ * at equal dimensions. The `filter` clause is what prevents cross-document
+ * and cross-embedding-space contamination — without it, a query vector could
+ * match chunks from an unrelated document, or (worse) chunks embedded by a
+ * different provider/model. Requires the Atlas index to define `documentId`,
+ * `embeddingProvider`, and `embeddingModel` as filter fields (see README).
  */
 export async function vectorSearchChunks(
   collection: ChunksAggregateCollection,
@@ -67,7 +70,7 @@ export async function vectorSearchChunks(
   const numCandidates = params.numCandidates ?? MONGODB_VECTOR_NUM_CANDIDATES ?? DEFAULT_VECTOR_SEARCH_NUM_CANDIDATES;
 
   logger.info("vector_search_started", {
-    documentId: params.documentId.toString(),
+    documentIds: params.documentIds.map((id) => id.toString()),
     embeddingProvider: params.embeddingProvider,
     embeddingModel: params.embeddingModel,
     limit: params.limit,
@@ -86,7 +89,7 @@ export async function vectorSearchChunks(
             limit: params.limit,
             filter: {
               $and: [
-                { documentId: params.documentId },
+                { documentId: { $in: params.documentIds } },
                 { embeddingProvider: params.embeddingProvider },
                 { embeddingModel: params.embeddingModel },
               ],
@@ -107,7 +110,7 @@ export async function vectorSearchChunks(
       .toArray();
 
     logger.info("vector_search_completed", {
-      documentId: params.documentId.toString(),
+      documentIds: params.documentIds.map((id) => id.toString()),
       resultCount: results.length,
     });
 
@@ -120,7 +123,7 @@ export async function vectorSearchChunks(
       score: result.score,
     }));
   } catch (error) {
-    logger.error("vector_search_failed", { documentId: params.documentId.toString(), error });
+    logger.error("vector_search_failed", { documentIds: params.documentIds.map((id) => id.toString()), error });
     throw vectorSearchFailedError(error);
   }
 }

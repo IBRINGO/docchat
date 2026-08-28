@@ -4,16 +4,17 @@ import { useEffect, useRef } from "react";
 import { MessageSquare } from "lucide-react";
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { ChatInput } from "@/components/chat/ChatInput";
+import { formatDocumentNameList } from "@/lib/utils/format";
 import type { ChatMessage as ChatMessageType } from "@/types/chat";
 
 export interface ChatContainerProps {
-  documentName: string;
+  documentNames: string[];
   messages: ChatMessageType[];
   isStreaming: boolean;
   onSend: (text: string) => void;
 }
 
-export function ChatContainer({ documentName, messages, isStreaming, onSend }: ChatContainerProps) {
+export function ChatContainer({ documentNames, messages, isStreaming, onSend }: ChatContainerProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -26,7 +27,7 @@ export function ChatContainer({ documentName, messages, isStreaming, onSend }: C
         {messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-zinc-400 dark:text-zinc-600">
             <MessageSquare className="h-8 w-8" strokeWidth={1.5} />
-            <p className="text-sm font-medium text-zinc-500 dark:text-zinc-400">Ask anything about {documentName}</p>
+            <p className="text-sm font-medium text-zinc-500 dark:text-zinc-400">Ask anything about {formatDocumentNameList(documentNames)}</p>
             <p className="max-w-xs text-xs">Answers are grounded strictly in the content of this document.</p>
           </div>
         ) : (

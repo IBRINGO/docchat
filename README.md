@@ -259,8 +259,10 @@ they arrive:
 ```bash
 curl -N -X POST http://localhost:3000/api/chat \
   -H "Content-Type: application/json" \
-  -d '{"documentId":"<id from the upload response>","message":"What are the objectives of the project?"}'
+  -d '{"documentIds":["<id from the upload response>"],"message":"What are the objectives of the project?"}'
 ```
+
+Add a second id to `documentIds` to chat across multiple documents at once (see "Multi-Document RAG & Conversations" below); add `"conversationId":"<id>"` to continue an existing conversation instead of starting a new one.
 
 ## Why not LangChain/LlamaIndex
 
@@ -282,10 +284,220 @@ keeps every one of those decisions visible and auditable in a handful of files.
 - All server-only dependencies (`mongodb`, `openai`, `@google/genai`, `lib/config/env.ts`, every `lib/services/*` and `lib/providers/*` module) are only ever imported from API routes — verified by inspecting the import graph of every client component/hook (`components/`, `hooks/`, `lib/client/`), none of which reach a server-only module.
 - **Not yet deployed to Vercel** — the above is a readiness review of the code, not a report of an actual deployment.
 
+## Document Library & Multi-Document Selection
+
+`GET /api/documents` lists previously uploaded documents with search, status filtering, and
+pagination:
+
+```
+GET /api/documents?q=report&status=ready&page=1&limit=20
+```
+
+| Param | Notes |
+| --- | --- |
+| `q` | optional, case-insensitive substring match on filename (regex-escaped — a literal match, never a pattern) |
+| `status` | optional, one of `processing` \| `ready` \| `failed` — the same `DocumentStatus` the rest of the app uses, no parallel status system |
+| `page` / `limit` | optional, default `1`/`20`, `limit` capped at `100` |
+
+The response never includes embeddings, chunk content, or embedding provider/model metadata —
+just what a document picker needs (`id`, `fileName`, `mimeType`, `size`, `pageCount`,
+`chunkCount`, `status`, `createdAt`, and `errorMessage` for failed documents only). Sorted
+newest-first, which the existing `documents_createdAt` index already serves — no new index was
+needed for this query shape at the project's scale.
+
+The frontend (`components/documents/`, `hooks/useDocumentLibrary.ts`,
+`hooks/useDocumentSelection.ts`) builds a document library on top of this: search, status tabs,
+and multi-select checkboxes. A document whose status isn't `ready` is rendered disabled and
+cannot be selected — this is enforced both visually and in `canSelectDocument()`
+(`lib/validation/document-selection.ts`), the same predicate that also gates the chat pipeline.
+
+### Why multi-document support does not multiply the original assessment limits
+
+The assessment specifies, per document: native-text PDF, ≤10 MB, ≤~50 pages. Multi-document
+selection is a bonus on top of that scope, not a way around it — so it enforces limits at two
+levels (`lib/config/document-limits.ts`, the single source of truth for both):
+
+1. **Per document (unchanged, now also checks page count):** `validateUploadedFile()` still
+   enforces the 10 MB / PDF-only checks at upload time; `DocumentIngestionService` now also
+   rejects a document over `MAX_DOCUMENT_PAGE_COUNT` (50) right after extraction — before
+   spending anything on chunking or embedding — with `PDF_TOO_MANY_PAGES`.
+2. **Per active selection:** `MAX_ACTIVE_SELECTION_TOTAL_SIZE_BYTES` and
+   `MAX_ACTIVE_SELECTION_TOTAL_PAGES` are **equal to**, not a multiple of, the single-document
+   limits (10 MB / 50 pages total, however many documents that spans). Selecting a second or
+   third document never raises the ceiling — it only lets the same fixed budget be spread across
+   more than one file.
+
+`lib/validation/document-selection.ts` is the framework-independent implementation:
+`validateSelectionLimits(currentSelection, candidate)` returns
+`{ valid, reason?: "MAX_TOTAL_SIZE" | "MAX_TOTAL_PAGES" | "MAX_TOTAL_SIZE_AND_PAGES", totals }`,
+and `toggleDocumentSelection(selectedIds, documentsById, targetId)` uses it to decide whether
+selecting a document is allowed — rejecting the attempt and leaving the existing selection
+untouched otherwise, never landing the user in an over-limit state. It has no React dependency,
+so `hooks/useDocumentSelection.ts` is a thin adapter, and the same functions are directly unit
+tested (`tests/document-selection.test.ts`) and reusable by a future API-side validation pass.
+
+No cap on the *number* of selected documents is enforced yet — the size/page totals are the real
+constraint — but `MAX_ACTIVE_SELECTION_DOCUMENT_COUNT` exists in `document-limits.ts` as an
+explicit, currently-`null` hook so one can be added later without restructuring callers.
+
+## Multi-Document RAG & Conversations
+
+`POST /api/chat` answers from one or more documents in a single request, and persists the
+conversation:
+
+```
+{ documentIds: string[], message: string, conversationId?: string }
+```
+
+`documentIds` fully replaces the earlier single-`documentId` contract — a deliberate, one-time
+breaking change (see Part 1 of the task this implements) rather than supporting two parallel
+request shapes indefinitely. A single document is just the `documentIds.length === 1` case; every
+rule below applies uniformly regardless of how many documents are selected. Duplicate IDs in the
+array are silently deduplicated (first-seen order kept), not rejected — an accidental repeat isn't
+a meaningfully different request. All of it is re-validated server-side (valid ObjectIds, every
+document exists and is `"ready"`, the combined selection respects the cumulative size/page limits)
+— the backend never trusts the frontend's own selection UI.
+
+### Embedding configuration grouping
+
+Documents in one request may have been embedded under different configurations — e.g. one via
+Gemini (`gemini-embedding-2`), another via the OpenAI fallback (`text-embedding-3-small`), because
+whichever provider happened to succeed at ingestion time for each one. **Vectors from different
+providers or models are never comparable, even at identical dimensions** — this is the same rule
+enforced for single-document retrieval, just applied per-document now instead of per-request.
+
+`RetrievalService.retrieve()` groups the selected documents by the triple
+`(embeddingProvider, embeddingModel, embeddingDimensions)` before doing anything else:
+
+```
+Group 1 — openai / text-embedding-3-small / 1536:  [Document A, Document C]
+Group 2 — gemini / gemini-embedding-2 / 1536:       [Document B, Document D]
+```
+
+For each group, independently: generate ONE query embedding using exactly that group's
+configuration (`EmbeddingService.generateEmbeddingForConfiguration` — never the default
+provider), then run one Atlas `$vectorSearch` scoped to that group's document IDs via a
+`documentId: { $in: [...] }` filter alongside the existing `embeddingProvider`/`embeddingModel`
+filters. This means one Atlas query per *distinct embedding configuration* in the request, not one
+per document — selecting five documents that all share the same configuration still costs exactly
+one query embedding and one vector search call.
+
+### Result merging and ranking
+
+Each group returns its own top-5 chunks, already sorted by Atlas's `vectorSearchScore`. The merge
+strategy is deliberately simple: concatenate every group's results, sort the combined list by
+score descending, and take the global top 5. No extra per-group rescaling is applied — for the
+cosine similarity metric this app's Atlas index uses, `vectorSearchScore` is normalized by Atlas
+itself onto a fixed 0–1 scale independent of the underlying embedding model, so a straightforward
+global sort is a reasonable, deterministic, and fully explainable merge without inventing a
+weighting scheme with no real evidence behind it. The final result is always bounded to 5 chunks
+regardless of how many documents (or groups) were selected — selecting more documents changes
+*which* chunks compete for those 5 slots, never how many make it into the prompt.
+
+**Lightweight lexical re-ranking (bonus) was deliberately not implemented.** Blending in a
+keyword/token-overlap signal on top of vector similarity is a real technique, but adding it here
+would mean inventing and tuning a semantic/lexical weighting scheme with no evaluation data to
+justify any particular weighting — that's exactly the kind of complexity this assessment's
+grounding/compatibility requirements were prioritized over. Semantic-first retrieval via Atlas
+Vector Search remains the sole ranking signal.
+
+### Grounded multi-document prompt
+
+`buildRagPrompt()` (unchanged location, `lib/rag/prompt.ts`) labels every `SOURCE [n]` block with
+its originating `Document:` name, and the system prompt explicitly instructs the model to
+attribute claims to the correct document, never claim a document says something it doesn't, and
+mention differences between documents when relevant — on top of the existing single-document
+grounding rules (context-only, no external knowledge, say when the answer isn't supported). This
+is still the *only* place prompt text is constructed; routes and services never build prompt text
+themselves.
+
+### Conversation data model
+
+Two new collections, `conversations` and `messages` (`types/conversation.ts`,
+`lib/db/collections.ts`):
+
+```ts
+Conversation { _id, title, documentIds: ObjectId[], createdAt, updatedAt }
+Message { _id, conversationId, role: "user" | "assistant", content, sources: SourceReference[], createdAt }
+```
+
+`sources` on an assistant message is a denormalized snapshot (`documentId`, `documentName`,
+`chunkId`, `content`, `pageNumber`, `chunkIndex`, `score`) — not a live reference — so conversation
+history keeps displaying correctly even if a source document is later deleted or re-ingested.
+User messages always store `sources: []`.
+
+### Conversation/document context rule
+
+**A conversation's document context is fixed at creation.** Continuing an existing conversation
+(`conversationId` provided) requires the request's `documentIds` to match the conversation's
+stored set exactly, order ignored — otherwise the request is rejected with
+`CONVERSATION_DOCUMENT_CONTEXT_MISMATCH` (409). This is a deliberate simplification: it avoids
+ever having to reconcile a mid-conversation switch between incompatible document/embedding
+contexts, and keeps "which documents was this conversation grounded in" an unambiguous, permanent
+fact. Changing the document selection always means starting a new conversation — the frontend
+(`hooks/useChat.ts`) detects this locally (comparing the active conversation's document set
+against the current selection) and starts fresh automatically rather than sending a request the
+server would reject anyway, showing a small notice first so the switch isn't silent.
+
+### Streaming persistence behavior
+
+`ChatService.prepare()` — which runs to completion *before* the SSE response starts — resolves/
+creates the conversation and persists the user message first, so a conversation only ever exists
+once its triggering message is known to be valid (a request that fails retrieval/validation never
+leaves an orphaned conversation behind). `ChatService.streamAnswer()` then collects the assistant's
+full text internally while forwarding each delta to the client, and persists it as the assistant
+message **only after generation has completed successfully** — a failed or mid-stream-interrupted
+generation is never saved as if it were a complete answer; only an SSE `error` event is sent, and
+the user's message (and any earlier turns) remain in the conversation. If persistence of the
+*already-fully-streamed* assistant message itself fails (e.g. a transient Mongo write error after
+generation succeeded), that failure is logged server-side but does not retroactively turn an
+answer the user already received into an error — the client still gets a normal `done`.
+
+The `metadata` SSE event now carries `conversationId` and `documentIds` alongside `sources`, so the
+client can associate the stream with the right conversation from the first event — see the
+Streaming protocol section above for the full event sequence (unchanged otherwise).
+
+### Conversation API
+
+| Endpoint | Notes |
+| --- | --- |
+| `GET /api/conversations?page=&limit=` | Summaries sorted by `updatedAt` descending — `id`, `title`, `documentIds`, `documentNames` (resolved via one batched lookup across the whole page, not one query per conversation), `createdAt`, `updatedAt` |
+| `GET /api/conversations/:id` | Full conversation metadata plus every message, oldest first, with each assistant message's `sources` |
+| `DELETE /api/conversations/:id` | Deletes the conversation's messages, then the conversation itself |
+
+All three are rate-limited the same best-effort way as `/api/chat` (see "Rate limiting" above),
+with a more generous limit since they're plain reads/deletes, not LLM calls.
+
+### Database indexes
+
+Added to `initializeDatabaseIndexes()` (`lib/db/indexes.ts`, still idempotent, still run manually
+via `npm run db:indexes` — never automatically):
+
+```
+conversations: { updatedAt: -1 }                     — powers GET /api/conversations' sort
+messages:      { conversationId: 1, createdAt: 1 }    — powers ordered message history lookup
+```
+
+### Frontend integration
+
+`hooks/useChat.ts` now owns one active conversation (messages + `conversationId`, previously just
+messages for a single fixed document) and exposes `sendMessage(documentIds, text)`,
+`loadConversation(...)` (restores an existing conversation's messages and document context — used
+when the sidebar is clicked), and `startNewChat()`. `hooks/useDocumentSelection.ts` gained
+`setSelection(ids)` for that same restoration path (bypassing the incremental add-one-at-a-time
+limit check, since a stored conversation's document set was already valid when created).
+`components/conversations/ConversationSidebar.tsx` is new: a "New chat" action plus the
+conversation list, each item showing its title and document names, with delete. The page layout
+(`app/page.tsx`) became two columns on larger screens — the conversation sidebar on the left,
+upload/library/selection/chat stacked in the main column — collapsing to a single stacked column
+on mobile.
+
 ## Known limitations
 
 - No OCR — scanned/image-only PDFs fail with `PDF_TEXT_NOT_EXTRACTABLE` at ingestion.
-- Chat history is session-only, kept in React state (`hooks/useChat.ts`); nothing is persisted, and reloading the page loses it.
-- Single-document chat only — there is no UI to select among multiple previously uploaded documents.
-- Rate limiting is a best-effort, single-instance limiter (see above), not a distributed production defense.
+- No lightweight lexical re-ranking — retrieval is semantic-only via Atlas Vector Search (see "Result merging and ranking" above for why).
+- Restoring an existing conversation restores its document *selection state* correctly, but a document the conversation references that has since scrolled off the currently-loaded/filtered library page won't visually appear checked in the list until it's loaded — a cosmetic edge case, not a data-correctness one (the conversation's real document context, enforced server-side, is unaffected).
+- Rate limiting is a best-effort, single-instance limiter (see below), not a distributed production defense.
 - The Atlas Vector Search index must be created and maintained manually (see above) — it is not managed by application code.
+- The document library's and conversation sidebar's "load more"/single-page pagination have no jump-to-page control — adequate at this project's scale.
+- No authentication — every conversation and document is visible to any client that can reach the API; access control is out of scope for this assessment.

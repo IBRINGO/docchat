@@ -25,3 +25,11 @@ export function pdfTextNotExtractableError(): AppError {
     status: 422,
   });
 }
+
+export function pdfTooManyPagesError(pageCount: number, maxPages: number): AppError {
+  return new AppError({
+    code: "PDF_TOO_MANY_PAGES",
+    message: `The document has ${pageCount} pages, which exceeds the maximum of ${maxPages} pages.`,
+    status: 422,
+  });
+}
