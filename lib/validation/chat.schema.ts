@@ -1,14 +1,12 @@
 import { z } from "zod";
 import { AppError } from "@/lib/utils/errors";
-
-/** 24 lowercase/uppercase hex characters — MongoDB's ObjectId string format. Checked explicitly here rather than via the driver's own ObjectId.isValid, which also loosely accepts other 12-byte-ish inputs we don't want to treat as valid at the HTTP boundary. */
-const OBJECT_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
+import { objectIdSchema } from "@/lib/validation/object-id";
 
 /** Generous enough for real questions, small enough to bound embedding/prompt cost. */
 export const MAX_MESSAGE_LENGTH = 2000;
 
-/** A defensive cap on how many document IDs one request can name — an API-input sanity bound against a malformed/abusive request body. Distinct from (and much looser than) the size/page-based cumulative selection limits enforced server-side in RetrievalService (see lib/config/document-limits.ts), which are the real business constraint. */
-const MAX_DOCUMENT_IDS_PER_REQUEST = 50;
+/** A defensive cap on how many document IDs one request can name — an API-input sanity bound against a malformed/abusive request body. Distinct from (and much looser than) the size/page-based cumulative selection limits enforced server-side in RetrievalService (see lib/config/document-limits.ts), which are the real business constraint. Also reused by create-conversation.schema.ts — the same sanity bound applies whenever a request names a document set, whether or not a message comes with it. */
+export const MAX_DOCUMENT_IDS_PER_REQUEST = 50;
 
 export interface ChatRequest {
   documentIds: string[];
@@ -23,8 +21,6 @@ function invalidChatRequestError(reason: string): AppError {
     status: 400,
   });
 }
-
-const objectIdSchema = z.string().regex(OBJECT_ID_PATTERN, "must be a valid MongoDB ObjectId");
 
 const chatRequestSchema = z.object({
   documentIds: z

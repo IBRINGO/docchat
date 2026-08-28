@@ -26,14 +26,15 @@ export function ChatInput({ onSend, disabled = false }: ChatInputProps) {
   };
 
   return (
-    <div className="flex items-end gap-2 rounded-2xl border border-zinc-200 bg-white p-2 dark:border-zinc-800 dark:bg-zinc-950">
+    <div className="flex items-end gap-2 rounded-2xl border border-zinc-200 bg-white p-2 transition-colors focus-within:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus-within:border-zinc-600">
       <textarea
         value={value}
         onChange={(event) => setValue(event.target.value)}
         onKeyDown={onKeyDown}
         disabled={disabled}
         rows={1}
-        placeholder={disabled ? "Waiting for the current answer…" : "Ask a question about this document…"}
+        aria-label="Ask a question"
+        placeholder={disabled ? "Waiting for the current answer…" : "Ask a question about your selected documents…"}
         className="max-h-40 min-h-[2.5rem] flex-1 resize-none bg-transparent px-2 py-1.5 text-sm text-zinc-900 outline-none placeholder:text-zinc-400 disabled:cursor-not-allowed dark:text-zinc-100 dark:placeholder:text-zinc-500"
       />
       <button

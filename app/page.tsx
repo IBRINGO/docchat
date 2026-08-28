@@ -1,18 +1,19 @@
 "use client";
 
 import { useCallback, useState } from "react";
-import { AlertCircle, FileStack, Info, Loader2, MessageSquare, X } from "lucide-react";
+import { AlertCircle, FileStack, Info, MessageSquare, X } from "lucide-react";
 import { UploadZone } from "@/components/upload/UploadZone";
+import { UploadQueueList } from "@/components/upload/UploadQueueList";
 import { DocumentLibrary } from "@/components/documents/DocumentLibrary";
 import { SelectedDocumentsSummary } from "@/components/documents/SelectedDocumentsSummary";
 import { ChatContainer } from "@/components/chat/ChatContainer";
 import { ConversationSidebar } from "@/components/conversations/ConversationSidebar";
-import { useDocumentUpload } from "@/hooks/useDocumentUpload";
+import { useMultiDocumentUpload, type UploadBatchResult } from "@/hooks/useMultiDocumentUpload";
 import { useDocumentLibrary } from "@/hooks/useDocumentLibrary";
 import { useDocumentSelection } from "@/hooks/useDocumentSelection";
 import { useConversations } from "@/hooks/useConversations";
 import { useChat } from "@/hooks/useChat";
-import { getConversation, deleteConversation, ApiError } from "@/lib/client/api";
+import { getConversation, deleteConversation, createConversation, ApiError } from "@/lib/client/api";
 import type { ChatMessage } from "@/types/chat";
 
 export default function Home() {
@@ -22,12 +23,49 @@ export default function Home() {
   const conversations = useConversations();
   const [conversationError, setConversationError] = useState<string | null>(null);
 
-  const handleUploaded = useCallback(() => {
-    // A newly uploaded document is deliberately left unselected — the user picks it explicitly.
+  const handleFileUploaded = useCallback(() => {
+    // A newly uploaded document is deliberately left unselected until the whole upload batch
+    // settles — see handleUploadBatchSettled, which decides the resulting selection at once.
     library.refresh();
   }, [library]);
 
-  const upload = useDocumentUpload(handleUploaded);
+  /**
+   * Fires once per upload action (not per file — see useMultiDocumentUpload's
+   * onBatchSettled) once every file in that batch has either succeeded or
+   * failed. Implements the "upload → new conversation" flow: the batch's
+   * successfully-uploaded documents become the active selection and get one
+   * new persisted conversation, which becomes the active chat — never one
+   * conversation per file, and never a conversation at all if nothing in the
+   * batch succeeded. If conversation creation fails (e.g. the combined
+   * selection violates the cumulative size/page limits), the uploaded
+   * documents are left exactly as they are — still uploaded, visible in the
+   * library — and a clear, non-destructive error explains what happened; the
+   * currently active conversation, if any, is never touched by any of this.
+   */
+  const handleUploadBatchSettled = useCallback(
+    async (result: UploadBatchResult) => {
+      library.refresh();
+
+      const readyDocumentIds = result.succeeded.map((item) => item.documentId).filter((id): id is string => id !== null);
+      if (readyDocumentIds.length === 0) return;
+
+      setConversationError(null);
+      try {
+        const conversation = await createConversation(readyDocumentIds);
+        selection.setSelection(readyDocumentIds);
+        chat.loadConversation(conversation.id, conversation.documentIds, []);
+        conversations.refresh();
+      } catch (error) {
+        const detail = error instanceof ApiError ? error.message : "Please select them manually to start a chat.";
+        setConversationError(
+          `${readyDocumentIds.length === 1 ? "Your document" : "Your documents"} uploaded successfully, but starting a new conversation failed: ${detail}`,
+        );
+      }
+    },
+    [library, selection, chat, conversations],
+  );
+
+  const upload = useMultiDocumentUpload(handleFileUploaded, handleUploadBatchSettled);
 
   const handleSend = useCallback(
     async (text: string) => {
@@ -105,11 +143,11 @@ export default function Home() {
           <header className="flex items-center gap-2">
             <FileStack className="h-5 w-5 text-zinc-900 dark:text-zinc-100" strokeWidth={1.75} />
             <span className="text-base font-semibold text-zinc-900 dark:text-zinc-100">DocChat</span>
-            <span className="text-sm text-zinc-500 dark:text-zinc-400">Chat With yours Documents</span>
+            <span className="text-sm text-zinc-500 dark:text-zinc-400">Chat with your documents</span>
           </header>
 
           {conversationError ? (
-            <p className="flex items-center gap-1.5 text-sm text-red-600 dark:text-red-400">
+            <p className="animate-fade-in-up flex items-center gap-1.5 text-sm text-red-600 dark:text-red-400">
               <AlertCircle className="h-4 w-4" />
               {conversationError}
               <button type="button" onClick={() => setConversationError(null)} aria-label="Dismiss" className="ml-1 text-red-400 hover:text-red-600 dark:hover:text-red-300">
@@ -119,21 +157,16 @@ export default function Home() {
           ) : null}
 
           <div className="flex flex-col gap-2">
-            <UploadZone onFileSelected={upload.upload} disabled={upload.stage === "uploading"} />
-            {upload.stage === "uploading" ? (
-              <p className="flex items-center gap-1.5 text-sm text-zinc-500 dark:text-zinc-400">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Uploading and processing your document…
-              </p>
-            ) : null}
-            {upload.stage === "error" && upload.errorMessage ? (
-              <p className="flex items-center gap-1.5 text-sm text-red-600 dark:text-red-400">
-                <AlertCircle className="h-4 w-4" />
-                {upload.errorMessage}
-                <button type="button" onClick={upload.dismissError} aria-label="Dismiss" className="ml-1 text-red-400 hover:text-red-600 dark:hover:text-red-300">
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </p>
+            <UploadZone onFilesSelected={upload.addFiles} />
+            <UploadQueueList items={upload.items} onRemove={upload.removeItem} onRetry={upload.retryItem} />
+            {upload.items.length > 0 && !upload.isBusy ? (
+              <button
+                type="button"
+                onClick={upload.clearFinished}
+                className="self-start text-xs font-medium text-zinc-400 transition-colors hover:text-zinc-600 dark:hover:text-zinc-300"
+              >
+                Clear finished uploads
+              </button>
             ) : null}
           </div>
 
@@ -146,7 +179,7 @@ export default function Home() {
           />
 
           {selectionDiverged ? (
-            <p className="flex items-center gap-1.5 rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+            <p className="animate-fade-in-up flex items-center gap-1.5 rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
               <Info className="h-4 w-4 shrink-0" />
               Document selection changed. Sending a message will start a new conversation with the selected documents.
             </p>
@@ -180,8 +213,6 @@ export default function Home() {
             hasMore={library.hasMore}
             onLoadMore={library.loadMore}
           />
-
-
         </div>
       </div>
     </div>

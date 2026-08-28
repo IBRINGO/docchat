@@ -47,6 +47,61 @@ export async function uploadDocument(file: File): Promise<UploadedDocument> {
   return (payload as { document: UploadedDocument }).document;
 }
 
+export interface UploadWithProgressCallbacks {
+  /** Fires repeatedly while the request body is being sent — 0 to 100. */
+  onProgress?: (percent: number) => void;
+  /** Fires once when the request body has fully reached the server and the response (extraction/chunking/embedding/persistence) is pending. */
+  onUploadComplete?: () => void;
+}
+
+export interface UploadWithProgressHandle {
+  promise: Promise<UploadedDocument>;
+  abort: () => void;
+}
+
+/**
+ * Same contract as uploadDocument, but via XMLHttpRequest so genuine
+ * client-observable progress is available: `onProgress` tracks bytes of the
+ * request body actually sent (the "uploading" phase), and `onUploadComplete`
+ * marks the moment the browser has finished sending — after that point the
+ * server is doing extraction/chunking/embedding/persistence with no further
+ * client-visible signal until the response arrives (the "processing" phase).
+ * Used by hooks/useMultiDocumentUpload.ts to drive real, honest per-file
+ * queue states instead of a single opaque "uploading" spinner.
+ */
+export function uploadDocumentWithProgress(file: File, callbacks: UploadWithProgressCallbacks = {}): UploadWithProgressHandle {
+  const xhr = new XMLHttpRequest();
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const promise = new Promise<UploadedDocument>((resolve, reject) => {
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) callbacks.onProgress?.(Math.round((event.loaded / event.total) * 100));
+    });
+    xhr.upload.addEventListener("load", () => callbacks.onUploadComplete?.());
+    xhr.addEventListener("load", () => {
+      let payload: unknown = null;
+      try {
+        payload = JSON.parse(xhr.responseText);
+      } catch {
+        payload = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && !isErrorPayload(payload)) {
+        resolve((payload as { document: UploadedDocument }).document);
+      } else {
+        const error = isErrorPayload(payload) ? payload.error : undefined;
+        reject(new ApiError(error?.code ?? "UNKNOWN_ERROR", error?.message ?? "The document could not be uploaded."));
+      }
+    });
+    xhr.addEventListener("error", () => reject(new ApiError("NETWORK_ERROR", "A network error occurred while uploading.")));
+    xhr.addEventListener("abort", () => reject(new ApiError("UPLOAD_ABORTED", "The upload was cancelled.")));
+    xhr.open("POST", "/api/upload");
+    xhr.send(formData);
+  });
+
+  return { promise, abort: () => xhr.abort() };
+}
+
 export interface ListDocumentsParams {
   q?: string;
   status?: "processing" | "ready" | "failed";
@@ -127,6 +182,37 @@ export async function getConversation(conversationId: string): Promise<GetConver
   }
 
   return payload as GetConversationResult;
+}
+
+export interface CreatedConversation {
+  id: string;
+  title: string;
+  documentIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Explicitly creates a conversation for a document set via POST /api/conversations,
+ * before any message exists — used right after a successful upload batch (see
+ * hooks/useMultiDocumentUpload.ts's onBatchSettled). The server validates the
+ * document set itself (existence, ready status, cumulative limits); this
+ * throws ApiError with the server's message if that validation fails.
+ */
+export async function createConversation(documentIds: string[]): Promise<CreatedConversation> {
+  const response = await fetch("/api/conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ documentIds }),
+  });
+  const payload: unknown = await response.json().catch(() => null);
+
+  if (!response.ok || isErrorPayload(payload)) {
+    const error = isErrorPayload(payload) ? payload.error : undefined;
+    throw new ApiError(error?.code ?? "UNKNOWN_ERROR", error?.message ?? "The conversation could not be created.");
+  }
+
+  return (payload as { conversation: CreatedConversation }).conversation;
 }
 
 /** Deletes a conversation and its messages via DELETE /api/conversations/:id. */

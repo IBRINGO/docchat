@@ -1,13 +1,23 @@
-import { ObjectId, type Collection } from "mongodb";
 import { getChunksCollection, getDocumentsCollection } from "@/lib/db/collections";
 import { vectorSearchChunks, type ChunksAggregateCollection } from "@/lib/db/vector-search";
 import { getEmbeddingService, type EmbeddingService } from "@/lib/services/embedding.service";
 import type { EmbeddingConfiguration } from "@/lib/providers/embedding.provider";
-import { validateSelectionSet, type SelectableDocument } from "@/lib/validation/document-selection";
+import { resolveAndValidateDocuments, type DocumentLookupCollection } from "@/lib/services/document-selection.service";
 import { logger } from "@/lib/utils/logger";
 import { AppError } from "@/lib/utils/errors";
 import type { RetrievalResult } from "@/lib/rag/retrieval.types";
-import type { Document as DocumentEntity, DocumentStatus } from "@/types/document";
+import type { Document as DocumentEntity } from "@/types/document";
+
+// Re-exported for callers/tests that reason about retrieval failures — the actual definitions
+// live in document-selection.service.ts, shared with POST /api/conversations' explicit
+// conversation-creation path (see that module's doc comment for why).
+export {
+  invalidDocumentIdError,
+  documentNotFoundError,
+  documentNotReadyError,
+  documentSelectionLimitExceededError,
+  type DocumentLookupCollection,
+} from "@/lib/services/document-selection.service";
 
 /** Chunks returned per embedding-configuration group, and the bound on the final merged/globally-ranked result. Fixed by design, not client-configurable — keeps the prompt bounded regardless of how many documents are selected (see README, "Result merging"). */
 const TOP_K_PER_GROUP = 5;
@@ -21,48 +31,12 @@ export interface RetrievalRequest {
 /** The slice of EmbeddingService this orchestrator actually calls — small enough to fake directly in tests. */
 export type QueryEmbeddingGenerator = Pick<EmbeddingService, "generateEmbeddingForConfiguration">;
 
-/** The slice of Collection<Document> this orchestrator actually calls — small enough to fake directly in tests. */
-export type DocumentLookupCollection = Pick<Collection<DocumentEntity>, "find">;
-
-export function invalidDocumentIdError(): AppError {
-  return new AppError({
-    code: "INVALID_DOCUMENT_ID",
-    message: "One or more documentIds are not valid identifiers.",
-    status: 400,
-  });
-}
-
-export function documentNotFoundError(): AppError {
-  return new AppError({
-    code: "DOCUMENT_NOT_FOUND",
-    message: "One or more of the selected documents could not be found.",
-    status: 404,
-  });
-}
-
-export function documentNotReadyError(status: DocumentStatus): AppError {
-  return new AppError({
-    code: "DOCUMENT_NOT_READY",
-    message: `One or more of the selected documents is not ready for retrieval (status: ${status}).`,
-    status: 409,
-  });
-}
-
 export function embeddingConfigurationMissingError(): AppError {
   return new AppError({
     code: "EMBEDDING_CONFIGURATION_MISSING",
     message: "A selected document has no embedding configuration recorded.",
     status: 500,
   });
-}
-
-export function documentSelectionLimitExceededError(reason: "MAX_TOTAL_SIZE" | "MAX_TOTAL_PAGES" | "MAX_TOTAL_SIZE_AND_PAGES"): AppError {
-  const messages: Record<typeof reason, string> = {
-    MAX_TOTAL_SIZE: "The selected documents exceed the maximum combined size allowed for one chat request.",
-    MAX_TOTAL_PAGES: "The selected documents exceed the maximum combined page count allowed for one chat request.",
-    MAX_TOTAL_SIZE_AND_PAGES: "The selected documents exceed both the maximum combined size and page count allowed for one chat request.",
-  };
-  return new AppError({ code: "DOCUMENT_SELECTION_LIMIT_EXCEEDED", message: messages[reason], status: 400 });
 }
 
 interface EmbeddingConfigurationGroup {
@@ -118,36 +92,7 @@ export class RetrievalService {
 
   async retrieve(request: RetrievalRequest): Promise<RetrievalResult> {
     const uniqueIds = Array.from(new Set(request.documentIds));
-
-    let objectIds: ObjectId[];
-    try {
-      objectIds = uniqueIds.map((id) => new ObjectId(id));
-    } catch {
-      throw invalidDocumentIdError();
-    }
-
-    const documentsCollection = await this.getDocuments();
-    const documents = await documentsCollection.find({ _id: { $in: objectIds } }).toArray();
-
-    if (documents.length !== objectIds.length) {
-      throw documentNotFoundError();
-    }
-
-    const notReady = documents.find((document) => document.status !== "ready");
-    if (notReady) {
-      throw documentNotReadyError(notReady.status);
-    }
-
-    const selectable: SelectableDocument[] = documents.map((document) => ({
-      id: document._id.toString(),
-      status: document.status,
-      size: document.size,
-      pageCount: document.pageCount,
-    }));
-    const selectionValidation = validateSelectionSet(selectable);
-    if (!selectionValidation.valid) {
-      throw documentSelectionLimitExceededError(selectionValidation.reason!);
-    }
+    const documents = await resolveAndValidateDocuments(request.documentIds, this.getDocuments);
 
     const groups = groupByEmbeddingConfiguration(documents);
     const documentNameById = new Map(documents.map((document) => [document._id.toString(), document.name]));

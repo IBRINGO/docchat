@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ObjectId } from "mongodb";
 import {
   ConversationService,
+  DEFAULT_CONVERSATION_TITLE,
   deriveConversationTitle,
   type ConversationsCollectionLike,
   type MessagesCollectionLike,
@@ -194,5 +195,80 @@ describe("ConversationService — creation and persistence", () => {
     });
     expect(inserted.sources[0].documentId.toString()).toBe(source.documentId);
     expect(inserted.sources[0].chunkId.toString()).toBe(source.id);
+  });
+});
+
+describe("ConversationService.createEmptyConversation", () => {
+  it("creates a conversation with the placeholder title and exactly the given documentIds, with no message yet", async () => {
+    const conversations = fakeConversationsCollection();
+    const service = new ConversationService(async () => conversations, async () => fakeMessagesCollection());
+    const docA = new ObjectId().toString();
+    const docB = new ObjectId().toString();
+
+    const conversation = await service.createEmptyConversation([docA, docB]);
+
+    expect(conversation.title).toBe(DEFAULT_CONVERSATION_TITLE);
+    expect(conversation.documentIds.map((id) => id.toString())).toEqual([docA, docB]);
+    expect(conversations.insertOne).toHaveBeenCalledWith(conversation);
+  });
+
+  it("never mutates or deletes any other conversation — only inserts the new one", async () => {
+    const conversations = fakeConversationsCollection();
+    const service = new ConversationService(async () => conversations, async () => fakeMessagesCollection());
+
+    await service.createEmptyConversation([new ObjectId().toString()]);
+
+    expect(conversations.insertOne).toHaveBeenCalledTimes(1);
+    expect(conversations.updateOne).not.toHaveBeenCalled();
+    expect(conversations.deleteOne).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConversationService.persistUserMessage — placeholder retitling", () => {
+  it("retitles a conversation that still has the placeholder title when its first message is persisted", async () => {
+    const conversations = fakeConversationsCollection();
+    const messages = fakeMessagesCollection();
+    const service = new ConversationService(async () => conversations, async () => messages);
+    const conversationId = new ObjectId();
+
+    await service.persistUserMessage(conversationId, "What is the total budget for this project?");
+
+    expect(conversations.updateOne).toHaveBeenCalledWith(
+      { _id: conversationId, title: DEFAULT_CONVERSATION_TITLE },
+      { $set: { title: "What is the total budget for this project?" } },
+    );
+  });
+
+  it("still touches updatedAt alongside the conditional retitle attempt", async () => {
+    const conversations = fakeConversationsCollection();
+    const messages = fakeMessagesCollection();
+    const service = new ConversationService(async () => conversations, async () => messages);
+    const conversationId = new ObjectId();
+
+    await service.persistUserMessage(conversationId, "hello");
+
+    expect(conversations.updateOne).toHaveBeenCalledWith(
+      { _id: conversationId },
+      expect.objectContaining({ $set: expect.objectContaining({ updatedAt: expect.any(Date) }) }),
+    );
+  });
+
+  it("attempts the conditional retitle even for a conversation that already has a real title — the {_id, title: placeholder} filter itself is what makes this a no-op server-side, not client logic", async () => {
+    // The fake collection here doesn't simulate Mongo's filter matching (that's the real driver's
+    // job) — this test documents and locks in the exact filter shape ConversationService sends,
+    // which is what actually guarantees a no-op against a conversation whose title has already
+    // moved on from the placeholder.
+    const conversations = fakeConversationsCollection();
+    const messages = fakeMessagesCollection();
+    const service = new ConversationService(async () => conversations, async () => messages);
+    const conversationId = new ObjectId();
+
+    await service.persistUserMessage(conversationId, "a second message");
+
+    const retitleCall = conversations.updateOne.mock.calls.find(
+      (call) => (call[0] as { title?: string }).title === DEFAULT_CONVERSATION_TITLE,
+    );
+    expect(retitleCall).toBeDefined();
+    expect(retitleCall?.[0]).toEqual({ _id: conversationId, title: DEFAULT_CONVERSATION_TITLE });
   });
 });

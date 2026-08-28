@@ -24,8 +24,10 @@ docchat/
 │   ├── layout.tsx
 │   └── page.tsx              # Upload → processing → chat client page
 ├── components/
-│   ├── upload/                # UploadZone, ProcessingStatus, DocumentInfo
-│   └── chat/                  # ChatContainer, ChatMessage, ChatInput, SourceList
+│   ├── upload/                # UploadZone (multi-file), UploadQueueList
+│   ├── documents/              # DocumentLibrary, selection UI
+│   ├── conversations/          # ConversationSidebar
+│   └── chat/                  # ChatContainer, ChatMessage, MarkdownMessage, ChatInput, SourceList, SourceCard
 ├── hooks/                     # useDocumentUpload, useChat (client-only React state)
 ├── lib/
 │   ├── client/                 # Browser-only fetch/SSE client (no server imports)
@@ -463,10 +465,57 @@ Streaming protocol section above for the full event sequence (unchanged otherwis
 | --- | --- |
 | `GET /api/conversations?page=&limit=` | Summaries sorted by `updatedAt` descending — `id`, `title`, `documentIds`, `documentNames` (resolved via one batched lookup across the whole page, not one query per conversation), `createdAt`, `updatedAt` |
 | `GET /api/conversations/:id` | Full conversation metadata plus every message, oldest first, with each assistant message's `sources` |
+| `POST /api/conversations` | `{documentIds: string[]}` → creates a conversation with **no messages yet** and the placeholder title `"New conversation"`. Documents are re-validated server-side exactly like `/api/chat` does (`lib/services/document-selection.service.ts`, shared by both routes — see below) — existence, `"ready"` status, cumulative size/page limits. Returns `201` with `{id, title, documentIds, createdAt, updatedAt}`. |
 | `DELETE /api/conversations/:id` | Deletes the conversation's messages, then the conversation itself |
 
-All three are rate-limited the same best-effort way as `/api/chat` (see "Rate limiting" above),
-with a more generous limit since they're plain reads/deletes, not LLM calls.
+All four are rate-limited the same best-effort way as `/api/chat` (see "Rate limiting" above),
+with a more generous limit since none of them call an LLM.
+
+`POST /api/conversations` doesn't replace the normal chat flow — `POST /api/chat` with no
+`conversationId` still creates a conversation implicitly alongside a first message, unchanged. This
+route adds the one path the app didn't have: starting a persisted, selectable conversation *before*
+any message exists, used by the upload flow below. The document-existence/ready/cumulative-limit
+validation previously lived only inside `RetrievalService`; it's now `resolveAndValidateDocuments()`
+in `lib/services/document-selection.service.ts`, and `RetrievalService.retrieve()` was updated to
+call it too — one implementation, not two copies of the same rules.
+
+### Upload-to-conversation flow
+
+Uploading document(s) automatically starts a new conversation for them, so the user goes from
+"upload" straight to "ask a question" without a manual selection step:
+
+```
+upload batch settles (every file in ONE addFiles() call has succeeded or failed — see
+hooks/useMultiDocumentUpload.ts's onBatchSettled, never fired per-file)
+  → refresh the document library
+  → collect the batch's successfully-uploaded ("ready") document IDs
+  → if none succeeded: stop — no conversation is created
+  → POST /api/conversations with exactly those IDs (server re-validates them)
+  → on success: that document set becomes the active selection, the new (still-empty)
+    conversation becomes the active chat, and it appears at the top of the conversation sidebar
+  → on failure (e.g. the combined selection exceeds the cumulative size/page limit): the uploaded
+    documents are left exactly as they are — still uploaded, visible in the library, selectable
+    manually — a clear, non-destructive error explains what happened, and the previously active
+    conversation (if any) is completely untouched
+```
+
+One upload batch always produces at most one conversation, never one per file — `getBatchResult()`
+(`lib/upload/upload-queue.ts`) splits a batch into its succeeded/failed items only once every item
+in it has reached a terminal state, and a `notifiedBatchesRef` guard in the hook ensures this fires
+exactly once per batch even if a failed file from an already-settled batch is retried afterward.
+Failed uploads are simply excluded from the document set the conversation gets created for.
+
+The freshly-created empty conversation is activated via the same `useChat.loadConversation(id,
+documentIds, [])` restoration path used for reopening any past conversation — with an empty message
+list, since there's nothing to restore yet. Its placeholder title, `"New conversation"`
+(`ConversationService.DEFAULT_CONVERSATION_TITLE`), is deliberately not LLM-generated — the same
+"why" as `deriveConversationTitle` — and is replaced with a real, message-derived title the moment
+the user's first message is persisted to it (`ConversationService.persistUserMessage` →
+`retitleIfPlaceholder`, an atomic `updateOne` filtered on `{_id, title: "New conversation"}`, so it
+only ever fires once and is a guaranteed no-op for every conversation that already has a real
+title). From that point on it's indistinguishable from any other conversation, including in how
+`POST /api/chat` continues it — the document-context-fixed and mismatch-rejection rules described
+above apply to it exactly as they do to an implicitly-created conversation.
 
 ### Database indexes
 
@@ -483,14 +532,114 @@ messages:      { conversationId: 1, createdAt: 1 }    — powers ordered message
 `hooks/useChat.ts` now owns one active conversation (messages + `conversationId`, previously just
 messages for a single fixed document) and exposes `sendMessage(documentIds, text)`,
 `loadConversation(...)` (restores an existing conversation's messages and document context — used
-when the sidebar is clicked), and `startNewChat()`. `hooks/useDocumentSelection.ts` gained
-`setSelection(ids)` for that same restoration path (bypassing the incremental add-one-at-a-time
-limit check, since a stored conversation's document set was already valid when created).
-`components/conversations/ConversationSidebar.tsx` is new: a "New chat" action plus the
+both when the sidebar is clicked AND right after an upload-triggered conversation is created, with
+an empty message list in that second case), and `startNewChat()`. `hooks/useDocumentSelection.ts`
+gained `setSelection(ids)` for that same restoration path (bypassing the incremental
+add-one-at-a-time limit check, since a stored conversation's document set was already valid when
+created). `components/conversations/ConversationSidebar.tsx` is new: a "New chat" action plus the
 conversation list, each item showing its title and document names, with delete. The page layout
 (`app/page.tsx`) became two columns on larger screens — the conversation sidebar on the left,
 upload/library/selection/chat stacked in the main column — collapsing to a single stacked column
-on mobile.
+on mobile. `app/page.tsx`'s `handleUploadBatchSettled` is the small page-level orchestration
+callback implementing the upload-to-conversation flow above — it composes `useMultiDocumentUpload`,
+`useDocumentLibrary`, `useDocumentSelection`, `useChat`, and `useConversations` rather than any of
+those hooks reaching into each other directly.
+
+### Opening an existing conversation with a stale/filtered document library
+
+Opening a past conversation always loads correctly and restores its real `documentIds`
+server-side, regardless of the document library's current pagination/search/filter state — this
+was already true before this pass (`hooks/useChat.ts`'s `loadConversation` sets the selection
+directly from the conversation's own `documentIds`, not by cross-referencing what's currently
+loaded in the library) and remains the mechanism the upload-to-conversation flow reuses.
+
+## UI/UX Enhancement Pass
+
+A polish pass on top of the working RAG/conversation architecture above — no retrieval, prompt,
+streaming-protocol, persistence, or validation *rule* changed; this section only covers what the
+frontend does with them.
+
+### Multi-file upload
+
+`UploadZone` now accepts any number of PDFs at once (`<input multiple>`, drag-and-drop of multiple
+files). `POST /api/upload` itself is unchanged — still exactly one file per request — so the
+frontend orchestrates the batch: `hooks/useMultiDocumentUpload.ts` uploads queued files **one at a
+time** (a small, safe concurrency strategy, not unlimited parallel requests) via a new
+`uploadDocumentWithProgress()` (`lib/client/api.ts`), which uses `XMLHttpRequest` instead of `fetch`
+specifically to get real upload-progress events.
+
+All the actual queue bookkeeping — which state comes after which, what a retry/remove is allowed to
+do — is pure and framework-free in `lib/upload/upload-queue.ts` (mirroring the existing
+`lib/validation/document-selection.ts` + `hooks/useDocumentSelection.ts` pattern), so it's unit
+tested without touching the DOM, `fetch`, or a network. Each file has an honestly-derived status:
+
+```
+queued → uploading (0-100%, real XHR upload-progress) → processing (request fully sent, awaiting
+the server's extraction/chunking/embedding/persistence — no further client-observable signal until
+the response arrives) → ready | failed
+```
+
+An invalid file (wrong extension, over the size limit — checked via
+`lib/validation/upload-client.ts`, which imports the same `MAX_UPLOAD_SIZE_BYTES` the server
+enforces rather than a duplicated literal) is kept in the queue as `failed` with its reason, never
+silently dropped, so a batch with some good and some bad files shows every outcome. A queued item
+can be removed before it starts; a failed item can be retried; an in-flight item cannot be removed
+(the request is still outstanding). After each file finishes, the document library refreshes; the
+current document selection and active conversation are both left untouched, and a newly uploaded
+document is never auto-selected — matching the prior single-file behavior.
+
+### Markdown rendering for assistant answers
+
+Assistant messages are rendered with [`react-markdown`](https://github.com/remarkjs/react-markdown)
+(`components/chat/MarkdownMessage.tsx`) plus `remark-gfm` for tables/strikethrough/task-list syntax
+— the only two dependencies added in this pass. `react-markdown` parses to a React element tree
+rather than `dangerouslySetInnerHTML`, and without the optional `rehype-raw` plugin (deliberately
+not added), any literal HTML the model emits renders as inert text, not markup — safe by default
+with no extra sanitization step needed. Streaming-safe by construction: the full accumulated answer
+is re-parsed on every render, so an incomplete construct (e.g. an unclosed `**`) just displays
+literally for the instant before its closing marker arrives, then self-corrects. Typography is
+hand-written in `app/globals.css` (`.prose-chat`) rather than pulling in `@tailwindcss/typography`,
+since the message bubble only ever needs a bounded set of elements.
+
+### Source relevance presentation
+
+`lib/utils/relevance.ts` turns an Atlas `vectorSearchScore` into a percentage and a restrained
+qualitative label — `Strong match` / `Relevant match` / `Lower match` — deliberately never using the
+word "confidence": it's a similarity ranking signal, not a correctness probability. The thresholds
+(≥0.75 strong, ≥0.5 relevant) are a reasonable display bucketing, not scientifically calibrated, and
+purely presentational — nothing in the retrieval/merge pipeline depends on them. `SourceCard`
+(`components/chat/SourceCard.tsx`) shows the label and percentage as text, not color alone.
+
+### Full chunk preview
+
+Each source card's excerpt can be expanded in place via a "View full source" toggle — an inline
+expandable panel rather than a portal-based popover/modal, which keeps it fully keyboard-accessible
+for free (a plain `<button aria-expanded aria-controls>`, no focus trap or Escape handling to get
+right) and works identically with click/tap on desktop and mobile.
+
+### Honest streaming-stage indicator
+
+While an assistant message is still empty, the UI shows one of two labels — "Searching selected
+documents…" or "Generating response…" — mapped to real, client-observable phases of `POST
+/api/chat`: the first covers everything the server does before its first SSE event (document/context
+resolution and vector search, inside `ChatService.prepare()`); the second covers the gap between
+that `metadata` event and the first `delta` (the LLM's time-to-first-token). No third fabricated
+stage is shown — there is no client-observable boundary between "prompt built" and "generation
+started" to represent honestly.
+
+### Other changes
+
+- **Copy answer**: a small copy button on each completed assistant message, using
+  `navigator.clipboard.writeText()`. It copies a plain-text version of the answer (Markdown
+  formatting characters stripped via `lib/utils/markdown.ts#markdownToPlainText`, a small
+  regex-based pass — not a full parser), not the raw Markdown source, and reports failure instead of
+  failing silently.
+- **Stable scrolling**: the chat pane only auto-scrolls to the newest content when the reader is
+  already near the bottom — scrolling up to review earlier messages is never fought with an
+  automatic jump back down.
+- **Reduced motion**: the small set of custom entrance animations (`app/globals.css`) is disabled
+  under `prefers-reduced-motion: reduce`; everything else already used short (~150–300ms) Tailwind
+  transitions.
 
 ## Known limitations
 
@@ -501,3 +650,5 @@ on mobile.
 - The Atlas Vector Search index must be created and maintained manually (see above) — it is not managed by application code.
 - The document library's and conversation sidebar's "load more"/single-page pagination have no jump-to-page control — adequate at this project's scale.
 - No authentication — every conversation and document is visible to any client that can reach the API; access control is out of scope for this assessment.
+- An in-flight upload cannot be cancelled from the UI — `uploadDocumentWithProgress()` supports aborting the underlying `XMLHttpRequest`, but the upload queue only exposes remove/retry for items that aren't currently in flight, to avoid hiding an outstanding request from the list that describes it.
+- `markdownToPlainText()` (used by the copy-answer action) is a small regex-based pass covering the Markdown constructs the assistant actually produces (bold/italic, headings, lists, inline/fenced code) — not a full CommonMark-to-text converter; unusual or nested Markdown could copy with minor formatting artifacts.

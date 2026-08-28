@@ -6,6 +6,16 @@ import type { RetrievedChunk } from "@/lib/rag/retrieval.types";
 import type { Conversation, Message, SourceReference } from "@/types/conversation";
 
 const MAX_TITLE_LENGTH = 60;
+/**
+ * Placeholder title for a conversation created explicitly, before any
+ * message exists (see createEmptyConversation — used right after a
+ * successful document upload, so a conversation can be activated in the UI
+ * before the user has typed anything). Deliberately not LLM-generated — see
+ * deriveConversationTitle below for why a title is never worth a generation
+ * request. persistUserMessage replaces this with a real title, derived from
+ * whatever the first user message turns out to be, the moment one arrives.
+ */
+export const DEFAULT_CONVERSATION_TITLE = "New conversation";
 
 /** The slice of Collection<Conversation> this module actually calls — small enough to fake directly in tests. */
 export type ConversationsCollectionLike = Pick<Collection<Conversation>, "insertOne" | "findOne" | "updateOne" | "find" | "countDocuments" | "deleteOne">;
@@ -114,11 +124,28 @@ export class ConversationService {
   }
 
   async createConversation(documentIds: string[], firstMessage: string): Promise<Conversation> {
+    return this.insertConversation(documentIds, deriveConversationTitle(firstMessage));
+  }
+
+  /**
+   * Creates a conversation with no messages yet — used to start a
+   * conversation explicitly (e.g. immediately after a successful document
+   * upload batch, via POST /api/conversations) rather than implicitly
+   * alongside a first chat message. Callers are responsible for validating
+   * `documentIds` first (see lib/services/document-selection.service.ts) —
+   * this mirrors createConversation, which likewise assumes its caller
+   * (ChatService, via RetrievalService) already validated them.
+   */
+  async createEmptyConversation(documentIds: string[]): Promise<Conversation> {
+    return this.insertConversation(documentIds, DEFAULT_CONVERSATION_TITLE);
+  }
+
+  private async insertConversation(documentIds: string[], title: string): Promise<Conversation> {
     const conversations = await this.getConversations();
     const now = new Date();
     const conversation: Conversation = {
       _id: new ObjectId(),
-      title: deriveConversationTitle(firstMessage),
+      title,
       documentIds: documentIds.map((id) => new ObjectId(id)),
       createdAt: now,
       updatedAt: now,
@@ -132,7 +159,22 @@ export class ConversationService {
   async persistUserMessage(conversationId: ObjectId, content: string): Promise<void> {
     const messages = await this.getMessages();
     await messages.insertOne({ _id: new ObjectId(), conversationId, role: "user", content, sources: [], createdAt: new Date() });
+    await this.retitleIfPlaceholder(conversationId, content);
     await this.touchConversation(conversationId);
+  }
+
+  /**
+   * If this conversation still has the placeholder title from
+   * createEmptyConversation — meaning no message has retitled it yet — sets
+   * a real title derived from this message. A no-op for every other
+   * conversation (its title was already set at creation, or already
+   * retitled once), enforced atomically via the title in the update filter
+   * rather than a separate read-then-write, so this is safe to call on every
+   * user message without a race or a double-retitle.
+   */
+  private async retitleIfPlaceholder(conversationId: ObjectId, message: string): Promise<void> {
+    const conversations = await this.getConversations();
+    await conversations.updateOne({ _id: conversationId, title: DEFAULT_CONVERSATION_TITLE }, { $set: { title: deriveConversationTitle(message) } });
   }
 
   async persistAssistantMessage(conversationId: ObjectId, content: string, sources: RetrievedChunk[]): Promise<void> {

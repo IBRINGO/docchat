@@ -46,7 +46,7 @@ export function SelectedDocumentsSummary({ count, documentNames, totals, rejecti
             {documentNames.map((name) => (
               <span
                 key={name}
-                className="max-w-[220px] truncate rounded-full bg-zinc-100 px-2.5 py-1 text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400"
+                className="animate-fade-in max-w-[220px] truncate rounded-full bg-zinc-100 px-2.5 py-1 text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400"
                 title={name}
               >
                 {name}

@@ -62,7 +62,13 @@ export function useChat(): UseChatResult {
 
       const assistantId = nextMessageId();
       const userMessage: ChatMessage = { id: nextMessageId(), role: "user", content: trimmed };
-      const assistantPlaceholder: ChatMessage = { id: assistantId, role: "assistant", content: "", status: "streaming" };
+      const assistantPlaceholder: ChatMessage = {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        status: "streaming",
+        stage: "retrieving",
+      };
 
       if (continuingConversation) {
         setMessages((prev) => [...prev, userMessage, assistantPlaceholder]);
@@ -85,7 +91,7 @@ export function useChat(): UseChatResult {
             onMetadata: (metadata: ChatMetadata) => {
               setConversationId(metadata.conversationId);
               setConversationDocumentIds(metadata.documentIds);
-              updateAssistant({ sources: metadata.sources });
+              updateAssistant({ sources: metadata.sources, stage: "generating" });
             },
             onDelta: (delta) => {
               setMessages((prev) =>
