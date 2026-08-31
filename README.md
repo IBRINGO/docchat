@@ -1,194 +1,223 @@
-# DocChat - Smartly.ai Technical Test
+# DocChat
 
-## Description
-DocChat is a full-stack application that allows users to upload PDF documents and ask natural language questions about their content using RAG (Retrieval-Augmented Generation).
+DocChat is a full-stack RAG (Retrieval-Augmented Generation) application: upload one or more PDF
+documents, and ask natural-language questions about their content. Answers are streamed and
+strictly grounded in the retrieved excerpts — the model is instructed, and the application is
+coded, to say so explicitly rather than guess when an answer isn't supported by the document(s).
+
+Built for the **Senior Full Stack Engineer — AI / LLM** technical test ("DocChat — Posez des
+questions à vos PDF").
+
+## Demo
+
+- **Live app:** https://docchat-taupe.vercel.app
+- **Repository:** https://github.com/IBRINGO/docchat
+
+## Features
+
+Maps directly to the test's expected user flow:
+
+1. Open the public Vercel URL — no login required (see [Security](#security)).
+2. Upload one or more PDFs (drag-and-drop or browse), with real per-file upload progress.
+3. Only native-text PDFs are supported — no OCR (scanned/image-only PDFs are rejected with a
+   clear error at ingestion).
+4. Per-document limit enforced: **10 MB**, **50 pages**.
+5–6. Text is extracted (`pdfjs-dist`) and split into overlapping chunks.
+7–8. Chunks are embedded via an external embedding API (Gemini or OpenAI) and persisted to
+   MongoDB Atlas alongside the source document metadata.
+9. The user asks questions about one or more selected, ready documents.
+10. The backend runs an Atlas **`$vectorSearch`** query to retrieve the most relevant chunks.
+11–12. A grounded prompt is built from those chunks and sent to an LLM (Gemini or OpenAI), which
+   answers using only that context.
+13. If retrieval finds nothing relevant, the app returns a deterministic "not found in the
+   document" answer **without calling the LLM at all** — this is enforced in code, not left to the
+   model's discretion.
+14. The answer streams to the frontend via Server-Sent Events, rendered progressively as Markdown.
+15. Each answer shows its source chunks — document name, page, and a relevance percentage/label
+   derived from the vector similarity score — with an expandable full-text preview per source.
+
+Beyond the base flow, the app also persists **conversations**: multiple questions in a thread,
+conversation history in a sidebar, restoring a past conversation's exact messages and document
+context, and deleting a conversation.
 
 ## Architecture
 
-### Tech Stack
-- **Frontend**: Next.js 16 App Router (React 19, TypeScript, Tailwind CSS 4)
-- **Backend**: Next.js API Routes (Node.js runtime, streaming via the Web Streams API)
-- **Database**: MongoDB Atlas (documents + chunks, Atlas Vector Search for retrieval)
-- **Embeddings**: Gemini (`gemini-embedding-2`, primary) / OpenAI (`text-embedding-3-small`, fallback)
-- **Answer generation**: Gemini (`gemini-3.6-flash`, primary) / OpenAI (`gpt-4o-mini`, fallback)
-- **Deployment target**: Vercel (not yet deployed — see Vercel readiness below)
-
-No LangChain/LlamaIndex — see [Why not LangChain/LlamaIndex](#why-not-langchainllamaindex).
-
-### Project Structure
-```
-docchat/
-├── app/                      # Next.js App Router
-│   ├── api/upload/           # PDF upload + ingestion endpoint
-│   ├── api/chat/             # Retrieval + grounded streaming chat endpoint
-│   ├── layout.tsx
-│   └── page.tsx              # Upload → processing → chat client page
-├── components/
-│   ├── upload/                # UploadZone (multi-file), UploadQueueList
-│   ├── documents/              # DocumentLibrary, selection UI
-│   ├── conversations/          # ConversationSidebar
-│   └── chat/                  # ChatContainer, ChatMessage, MarkdownMessage, ChatInput, SourceList, SourceCard
-├── hooks/                     # useDocumentUpload, useChat (client-only React state)
-├── lib/
-│   ├── client/                 # Browser-only fetch/SSE client (no server imports)
-│   ├── db/                     # Mongo connection, collections, indexes, vector search
-│   ├── pdf/                    # PDF extraction + normalization
-│   ├── rag/                    # chunking, retrieval types, prompt construction
-│   ├── providers/              # embedding + LLM provider abstractions (OpenAI/Gemini)
-│   ├── services/                # orchestration: ingestion, embedding, retrieval, answer generation, chat
-│   ├── validation/              # request validation schemas
-│   └── utils/                   # errors, logging, rate limiting
-├── types/                      # shared TypeScript types
-└── tests/                      # Vitest unit tests (no network/DB/LLM calls)
+```mermaid
+flowchart TD
+    U["User (browser)"] --> FE["Next.js Frontend<br/>React 19 + Tailwind CSS 4"]
+    FE -->|"fetch / SSE"| API["Next.js API Routes<br/>Node.js runtime"]
+    API --> SVC["Service layer<br/>lib/services, lib/rag, lib/pdf"]
+    SVC --> ING["PDF Ingestion"]
+    SVC --> RET["Retrieval"]
+    SVC --> CHAT["Chat / Conversations"]
+    ING --> DB[("MongoDB Atlas<br/>documents, chunks")]
+    RET --> DB
+    RET -->|"$vectorSearch"| DB
+    CHAT --> DB2[("MongoDB Atlas<br/>conversations, messages")]
+    ING --> EMB["Embedding provider<br/>Gemini / OpenAI"]
+    RET --> EMB
+    CHAT --> LLM["LLM provider<br/>Gemini / OpenAI"]
 ```
 
-## Setup
+Every server-only dependency (`mongodb`, `openai`, `@google/genai`, `pdfjs-dist`,
+`lib/config/env.ts`, every `lib/services/*` / `lib/providers/*` module) is only ever imported from
+API routes — no client component or hook reaches a server-only module, so API keys and database
+credentials never enter the browser bundle.
 
-### Prerequisites
-- Node.js **20.16.0** (this project intentionally does not require a newer Node version)
-- MongoDB Atlas account, with a Vector Search index configured (see below)
-- A Gemini API key and/or an OpenAI API key (at least one; both enables fallback)
+## RAG Pipeline
 
-## Day 1 — Ingestion Pipeline
+**Ingestion** (`POST /api/upload` → `DocumentIngestionService`):
 
-`POST /api/upload` implements the full ingestion pipeline:
-
-```
-PDF file
-  → file validation (MIME type, extension, size, PDF signature)
-  → text extraction (lib/pdf/extract.ts, pdfjs-dist)
-  → text normalization (lib/pdf/normalize.ts)
-  → chunking (lib/rag/chunker.ts)
-  → embedding generation (lib/services/embedding.service.ts — Gemini primary, OpenAI fallback)
-  → embedding/chunk consistency validation
-  → MongoDB Atlas persistence (documents + chunks)
+```mermaid
+flowchart LR
+    PDF["PDF file"] --> EX["Text extraction<br/>(pdfjs-dist)"] --> NORM["Normalization"] --> CHUNK["Chunking<br/>(1000 chars, 200 overlap)"] --> EMB["Embeddings"] --> DB[("MongoDB Atlas<br/>documents + chunks")]
 ```
 
-The route itself (`app/api/upload/route.ts`) only validates the HTTP request and calls
-`DocumentIngestionService` (`lib/services/document-ingestion.service.ts`), which owns the
-pipeline end to end. A document is only ever written to MongoDB once extraction, chunking,
-embedding, and consistency checks have all already succeeded in memory — a bad PDF or a
-provider outage never leaves a document stuck in a half-processed state.
+Every step (extraction, chunking, embedding, cross-check) runs **in memory first**; a document is
+only written to MongoDB once the entire pipeline has already succeeded, so a bad PDF or a provider
+outage never leaves a document stuck half-processed. Chunking (`lib/rag/chunker.ts`) is a
+deterministic, hierarchical splitter: it prefers paragraph breaks, then sentence boundaries, then
+whitespace, and only hard-cuts as a last resort — chunk size **1000** characters, overlap **200**.
 
-### Production-safe PDF extraction (Node/Vercel compatibility)
+**Query** (`POST /api/chat` → `RetrievalService` → `ChatService`):
 
-`extractPdf()` (`lib/pdf/extract.ts`) uses `pdfjs-dist`'s Node ("legacy") build for text-only
-extraction — it never calls `page.render()`, only `page.getTextContent()`.
+```mermaid
+flowchart LR
+    Q["Question"] --> QE["Query embedding<br/>(document's exact provider/model)"] --> VS["Atlas $vectorSearch"] --> TK["Top-K chunks (K=5)"] --> P["Grounded prompt"] --> L["LLM (Gemini/OpenAI)"] --> SSE["SSE stream"] --> UI["Frontend"]
+```
 
-**Why uploads crashed on Vercel with `ReferenceError: DOMMatrix is not defined`, but not
-locally:** `pdfjs-dist`'s Node build unconditionally evaluates its canvas-*rendering* module code
-(`src/display/canvas.js`) the moment it's imported — including a module-top-level
-`const SCALE_MATRIX = new DOMMatrix();` that runs regardless of whether rendering is ever used.
-`DOMMatrix` isn't a real Node global; `pdfjs-dist` tries to self-polyfill it from its own
-*optional* dependency, the native `@napi-rs/canvas` package, published as a separate binary per
-platform. Locally, npm installed the Windows-native binary, so that self-polyfill silently
-succeeded. On Vercel's Linux serverless runtime, the matching native binary wasn't available at
-runtime — a well-known limitation of native optional dependencies under bundling/dependency
-tracing — so `pdfjs-dist` logged a warning, left `DOMMatrix` undefined, and the later top-level
-`new DOMMatrix()` threw instead, crashing module evaluation before the upload handler ever ran
-(consistent with the reported ~8ms execution duration and zero outgoing requests).
+If zero chunks come back, the LLM is never called — the app streams a deterministic "not found"
+answer (in English or French, detected from the question — see
+[Bonus Features](#bonus-features)) as a single event.
 
-**The fix** (`lib/pdf/node-polyfills.ts`, imported as the *first* import in `extract.ts`): define
-`globalThis.DOMMatrix` ourselves before `pdfjs-dist`'s module body ever runs, using
-[`@thednp/dommatrix`](https://www.npmjs.com/package/@thednp/dommatrix) — a small, dependency-free,
-pure-JS, DOMMatrix-API-compatible class (the maintained successor to the now-deprecated
-`dommatrix` package). Being pure JS rather than a native binary, it behaves identically on every
-platform, eliminating the exact native-optional-dependency gap that caused the crash. ESM
-guarantees static imports evaluate depth-first in source order, so putting the polyfill import
-first in `extract.ts` is what actually guarantees "before" — not a runtime check. The polyfill
-doesn't implement every method of the real browser `DOMMatrix` (e.g. `invertSelf`,
-`preMultiplySelf`) — only enough for `pdfjs-dist`'s module-evaluation-time code to finish loading.
-That's sufficient because this app's extraction path never reaches `pdfjs-dist`'s actual
-canvas-rendering functions (the only place those missing methods would be called) — if a future
-change ever needs real PDF rendering, a real canvas backend (e.g. `@napi-rs/canvas`, explicitly
-installed and verified on the target platform) would be required instead.
+## Multi-Document Retrieval
 
-`extractPdf()` and everything it depends on remains server-only (`lib/pdf/*` is only imported by
-`lib/services/document-ingestion.service.ts`, in turn only imported by `app/api/upload/route.ts`)
-— verified after this fix that neither `pdfjs-dist` nor `@thednp/dommatrix` appear anywhere in the
-client-side build output.
+Selecting several documents doesn't just loop retrieval per document — vectors from different
+embedding providers/models are **never comparable, even at equal dimensions**, so documents are
+first grouped by their exact stored `(embeddingProvider, embeddingModel, embeddingDimensions)`:
 
-### Environment variables
+```mermaid
+flowchart TD
+    SEL["Selected documents"] --> GRP{"Group by embedding<br/>provider + model + dimensions"}
+    GRP --> G1["Group 1: OpenAI docs"]
+    GRP --> G2["Group 2: Gemini docs"]
+    G1 --> E1["1 query embedding<br/>(OpenAI config)"] --> V1["Atlas $vectorSearch<br/>scoped to Group 1 IDs"]
+    G2 --> E2["1 query embedding<br/>(Gemini config)"] --> V2["Atlas $vectorSearch<br/>scoped to Group 2 IDs"]
+    V1 --> M["Merge: concat + sort by score desc"]
+    V2 --> M
+    M --> TOP["Global top 5 chunks"]
+```
 
-| Variable | Required for | Notes |
+One query embedding and one Atlas query **per distinct configuration present in the request**, not
+per document — five documents sharing one configuration still cost exactly one of each. Each
+group's own top-5 results (Atlas's `vectorSearchScore`) are concatenated, sorted by score
+descending, and sliced to a global top-5 — no per-group rescaling, since Atlas already normalizes
+`vectorSearchScore` to 0–1 for cosine similarity. Every requested document ID is re-validated
+server-side regardless (valid ObjectId, exists, `status: "ready"`, and the combined selection
+respects the cumulative 10 MB / 50-page limits) — the frontend's own selection UI is never trusted
+as the sole authority.
+
+## Conversations
+
+Two additional MongoDB collections, `conversations` and `messages`, back persistent chat history:
+
+```ts
+Conversation { _id, title, documentIds: ObjectId[], createdAt, updatedAt }
+Message { _id, conversationId, role: "user" | "assistant", content, sources: SourceReference[], createdAt }
+```
+
+- **A conversation's document set is fixed at creation.** Continuing an existing conversation
+  requires the request's `documentIds` to match the stored set exactly (order-independent) —
+  otherwise the request is rejected with `409 CONVERSATION_DOCUMENT_CONTEXT_MISMATCH`. Changing
+  documents always means starting a new conversation.
+- **Streaming-safe persistence:** the user's message is persisted *before* the SSE stream starts
+  (so a request that fails validation never leaves an orphaned conversation); the assistant's
+  message is persisted *only after* generation completes successfully — a failed or
+  mid-stream-interrupted answer is never saved as if complete.
+- **Titles** are derived deterministically from the first user message (truncated, no LLM call).
+  Uploading document(s) creates a conversation before any message exists, using the placeholder
+  title `"New conversation"`; that placeholder is atomically replaced the moment a first message
+  actually arrives.
+- The frontend shows exactly one of two modes at a time, derived purely from whether a real
+  `conversationId` is loaded (never from title): a **document workspace** (upload, library,
+  selection) or a focused **active conversation** view. "New Conversation" clears only client-side
+  state — no conversation is ever deleted by it.
+
+## PDF Ingestion
+
+- PDF only, verified by extension, MIME type, *and* the `%PDF-` magic-byte signature (not just a
+  trusted `Content-Type` header).
+- **10 MB** max file size, **50 pages** max — enforced server-side (`lib/validation/upload.schema.ts`,
+  `lib/config/document-limits.ts`), independent of any client-side check.
+- Text-only extraction via `pdfjs-dist` (no OCR); a scanned/image-only PDF fails with
+  `PDF_TEXT_NOT_EXTRACTABLE`.
+- On Vercel's Linux serverless runtime, `pdfjs-dist`'s Node build previously crashed at import time
+  with `ReferenceError: DOMMatrix is not defined` — see
+  [Technical Decisions & Trade-offs](#technical-decisions--trade-offs) for the root cause and fix.
+
+## Document Library & Upload UX
+
+- **Multi-file upload queue** (`hooks/useMultiDocumentUpload.ts`): any number of files, uploaded
+  sequentially (not unlimited-parallel), each with a real, honestly-derived status — `queued →
+  uploading (genuine XHR progress %) → processing → ready | failed`. A failed file stays visible
+  with its reason; it's never silently dropped, and a failed upload can be retried individually.
+- **Upload → conversation:** once every file in one upload action has settled, the
+  successfully-uploaded ("ready") documents become the active selection and get **one** new
+  persisted conversation — never one conversation per file, and none at all if every file failed.
+- **Document library** (`GET /api/documents`): filename search, status filtering
+  (processing/ready/failed), pagination.
+- **Multi-document selection** with a live running total (size/pages) against the cumulative
+  limits, and clear feedback when a selection would exceed them.
+- **Chat UI:** Markdown-rendered streamed answers (`react-markdown` + `remark-gfm`, no raw HTML
+  execution), source cards with a relevance label/percentage and an expandable full-chunk preview,
+  a copy-answer action, and restrained transitions that respect `prefers-reduced-motion`.
+
+## Tech Stack
+
+| Layer | Choice |
+| --- | --- |
+| Frontend | Next.js 16 App Router, React 19, TypeScript (strict), Tailwind CSS 4 |
+| Backend | Next.js API Routes, Node.js runtime (`export const runtime = "nodejs"`) |
+| Database | MongoDB Atlas — `documents`, `chunks`, `conversations`, `messages` collections + Atlas Vector Search |
+| Embeddings | Gemini `gemini-embedding-2` (primary) / OpenAI `text-embedding-3-small` (fallback) |
+| Answer generation | Gemini `gemini-3.6-flash` (primary) / OpenAI `gpt-4o-mini` (fallback) |
+| PDF parsing | `pdfjs-dist` (legacy Node build), text extraction only |
+| Markdown rendering | `react-markdown` + `remark-gfm` |
+| Validation | `zod` |
+| Testing | `vitest` |
+| Deployment | Vercel |
+
+No LangChain/LlamaIndex — justified in
+[Technical Decisions & Trade-offs](#technical-decisions--trade-offs).
+
+## Database Design
+
+| Collection | Purpose | Key fields |
 | --- | --- | --- |
-| `MONGODB_URI` | any database operation | Atlas connection string |
-| `MONGODB_DB_NAME` | any database operation | |
-| `GEMINI_API_KEY` | embedding generation and answer generation (both primary) | optional at startup; only validated when actually requested |
-| `OPENAI_API_KEY` | embedding generation and answer generation (both fallback) | optional; used only if Gemini fails with a recoverable error (rate limit, 5xx, network) |
-| `MONGODB_VECTOR_INDEX` | chat retrieval | optional, default `chunks_vector_index` — see Atlas Vector Search index below |
-| `MONGODB_VECTOR_NUM_CANDIDATES` | chat retrieval | optional, default `50` — Atlas candidate pool size per query |
+| `documents` | One record per uploaded PDF | `status` (`processing`\|`ready`\|`failed`), `pageCount`, `chunkCount`, `embeddingProvider`/`embeddingModel`/`embeddingDimensions`, `errorCode`/`errorMessage` |
+| `chunks` | One record per text chunk | `documentId` (references `documents._id`), `content`, `pageNumber`, `chunkIndex`, `embedding: number[]`, and its own copy of `embeddingProvider`/`embeddingModel`/`embeddingDimensions` (so a chunk's vector space is self-describing, not just inherited) |
+| `conversations` | One record per chat thread | `title`, `documentIds: ObjectId[]` (fixed at creation), `updatedAt` (bumped on every message) |
+| `messages` | One record per chat turn | `conversationId` (references `conversations._id`), `role`, `content`, `sources: SourceReference[]` (a denormalized snapshot — document name, chunk content, page, score at the time of the answer — so history still renders correctly even if a source document is later re-ingested or deleted) |
 
-### Manual end-to-end validation
+### Normal (non-vector) indexes
 
-1. Set `MONGODB_URI`, `MONGODB_DB_NAME`, and `GEMINI_API_KEY` (and optionally `OPENAI_API_KEY`) in `.env.local`.
-2. `npm run dev`
-3. Upload a PDF:
-
-   ```bash
-   curl -X POST http://localhost:3000/api/upload \
-     -F "file=@path/to/document.pdf"
-   ```
-
-4. A successful response looks like:
-
-   ```json
-   {
-     "success": true,
-     "document": {
-       "id": "...",
-       "fileName": "document.pdf",
-       "status": "ready",
-       "pageCount": 3,
-       "chunkCount": 12,
-       "embeddingConfiguration": { "provider": "gemini", "model": "gemini-embedding-2", "dimensions": 1536 }
-     }
-   }
-   ```
-
-5. In MongoDB Atlas, verify:
-   - `documents`: one new document, `status: "ready"`, correct `pageCount`/`chunkCount`, `embeddingProvider`/`embeddingModel`/`embeddingDimensions` populated.
-   - `chunks`: one document per chunk, `documentId` referencing the parent, `chunkIndex` sequential from 0, `embedding` populated, and `embeddingProvider`/`embeddingModel`/`embeddingDimensions` identical across every chunk of that document.
-
-## Day 2 — Retrieval, Grounded Answers & Streaming
-
-`POST /api/chat` runs the full RAG pipeline — retrieval, then a grounded, streamed answer:
+Created by `initializeDatabaseIndexes()` (`lib/db/indexes.ts`) — idempotent, run manually via
+`npm run db:indexes`, never automatically:
 
 ```
-{ documentId, message }
-  → request validation (lib/validation/chat.schema.ts)
-  → best-effort rate limit (lib/utils/rate-limit.ts)
-  → RetrievalService: load document (must be status: "ready"), embed the question in the
-    document's EXACT embedding configuration, run MongoDB Atlas $vectorSearch
-  → if zero chunks were retrieved: skip the LLM entirely, stream a deterministic
-    "not found in the document" answer (see "No-context behavior" below)
-  → otherwise: buildRagPrompt() (lib/rag/prompt.ts) constructs a grounded system prompt from
-    the retrieved chunks
-  → AnswerGenerationService streams the answer via Gemini (primary) or OpenAI (fallback)
-  → the response streams as Server-Sent Events: metadata → delta* → done (or error)
+documents:      { createdAt: -1 }                       — document library, newest first
+documents:      { status: 1 }                            — status filtering
+chunks:         { documentId: 1 }                         — delete/lookup all chunks of a document
+chunks:         { documentId: 1, chunkIndex: 1 } (unique) — ordered/unique chunk lookup
+chunks:         { documentId: 1, pageNumber: 1 }          — per-page chunk lookup
+conversations:  { updatedAt: -1 }                          — conversation list, newest activity first
+messages:       { conversationId: 1, createdAt: 1 }       — ordered message history per conversation
 ```
 
-`ChatService` (`lib/services/chat.service.ts`) is the orchestration layer tying these together;
-`RetrievalService` and `AnswerGenerationService` remain independent, separately testable services
-— retrieval logic is unaware that its output will be fed to an LLM at all.
+## Vector Search Index
 
-### Why the query embedding must match the document's configuration
-
-A document may have been
-embedded with either OpenAI (`text-embedding-3-small`) or Gemini (`gemini-embedding-2`) —
-whichever succeeded at ingestion time (see the fallback behavior above). OpenAI and Gemini
-vectors are not comparable, even at equal dimensions. `EmbeddingService.generateEmbeddings()`
-(used at ingestion) is unsuitable here because it always prefers Gemini first — blindly reusing
-it for a query would silently embed an OpenAI-configured document's question with Gemini,
-producing a vector search that can never match. `generateEmbeddingForConfiguration()` instead
-constructs the one provider matching the document's stored config, with no fallback, and rejects
-(`EMBEDDING_CONFIGURATION_MISMATCH`) if the provider ever returns a different provider/model/
-dimensions than requested.
-
-### MongoDB Atlas Vector Search index (not created by this codebase)
-
-Application code never creates the index — create it manually in the Atlas UI/CLI. Expected
-definition, name configurable via `MONGODB_VECTOR_INDEX` (default `chunks_vector_index`):
+**Not created by application code** — configured manually in the Atlas UI/CLI. Name is
+configurable via `MONGODB_VECTOR_INDEX` (default `chunks_vector_index`):
 
 ```json
 {
@@ -205,522 +234,430 @@ definition, name configurable via `MONGODB_VECTOR_INDEX` (default `chunks_vector
 }
 ```
 
-The three `filter` fields are required, not optional — they're how the query stays scoped to one
-document and one embedding space (see above). If the index is missing, misconfigured, or the
-query fails for any other reason, `POST /api/chat` returns a structured `VECTOR_SEARCH_FAILED`
-error; raw MongoDB/Atlas error detail is logged server-side only, never returned to the client.
+The three `filter` fields are required, not optional: they're what keeps one query scoped to a
+specific set of document IDs *and* one embedding space, preventing cross-document or
+cross-provider vector contamination. `numDimensions: 1536` matches this project's actual embedding
+models (both `text-embedding-3-small` and `gemini-embedding-2` are used at 1536 dimensions here);
+if a different model/dimension were ever used, the index would need to match it. If the index is
+missing, misconfigured, or the query fails for any reason, `POST /api/chat` returns a structured
+`502 VECTOR_SEARCH_FAILED` — raw MongoDB/Atlas error detail is logged server-side only.
 
-Additional environment variable: `MONGODB_VECTOR_NUM_CANDIDATES` (optional, default `50`) — the
-candidate pool size Atlas scans before returning the top 5 results.
+## API
 
-### Prompt grounding strategy
+All routes are under `app/api/`, declare `export const runtime = "nodejs"`, and return
+`{success: true, ...}` or `{success: false, error: {code, message}}` (never a raw stack trace or
+provider error).
 
-`buildRagPrompt()` (`lib/rag/prompt.ts`) is the only place that constructs an answer prompt — the
-API route and `ChatService` never assemble prompt text themselves, so every generation request
-carries the same rules. The system prompt lists retrieved chunks as numbered `SOURCE [n]` blocks
-(page number + content) and instructs the model to:
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/upload` | `POST` | Upload and ingest one PDF |
+| `/api/chat` | `POST` | Ask a question (SSE streamed answer) |
+| `/api/documents` | `GET` | List/search/filter uploaded documents |
+| `/api/conversations` | `GET` | List conversations |
+| `/api/conversations` | `POST` | Explicitly create a conversation (no message yet) |
+| `/api/conversations/:id` | `GET` | Load one conversation + its messages |
+| `/api/conversations/:id` | `DELETE` | Delete a conversation and its messages |
 
-- answer **only** from the supplied excerpts, never external knowledge or assumptions,
-- say explicitly that the information could not be found, rather than guess, when it isn't there,
-- say explicitly when the retrieved context is insufficient, rather than fill the gap,
-- reply in the same language as the question, preserve factual precision, and never mention the
-  instructions themselves or claim to have searched anything outside the excerpts.
+### `POST /api/upload`
 
-**No-context behavior:** when `RetrievalService` returns zero chunks, `ChatService` never calls an
-LLM at all — it streams a deterministic canned answer ("I couldn't find this information in the
-provided document." / the French equivalent for a French question) as a single `delta` event. This
-is enforced in code, not just prompted for, so there's no dependency on the model choosing to
-comply.
+`multipart/form-data`, field `file`. Validates MIME type, extension, size (≤10 MB), and the PDF
+magic-byte signature; rejects a document over 50 pages after extraction.
 
-### LLM provider / fallback behavior
+```json
+// 200
+{ "success": true, "document": {
+  "id": "...", "fileName": "report.pdf", "status": "ready",
+  "pageCount": 3, "chunkCount": 12,
+  "embeddingConfiguration": { "provider": "gemini", "model": "gemini-embedding-2", "dimensions": 1536 }
+}}
+```
 
-`AnswerGenerationService` (`lib/services/answer.service.ts`) mirrors the embedding layer's
-fallback contract, adapted for streaming: Gemini is primary, OpenAI is the fallback, and a
-fallback is only attempted when the primary fails **before yielding any output** with a
-recoverable error (network error, HTTP 429, or 5xx — identical rule to embeddings, shared via
-`lib/providers/recoverable-provider-error.ts`). A non-recoverable failure (bad request, invalid
-key, etc.) is never retried against the fallback.
+Errors: `400 FILE_MISSING`, `415 INVALID_FILE_TYPE`, `413 FILE_TOO_LARGE`,
+`422 INVALID_PDF_FILE` / `PDF_INVALID_INPUT` / `PDF_UNREADABLE` / `PDF_TEXT_NOT_EXTRACTABLE` /
+`PDF_TOO_MANY_PAGES`, `500 DOCUMENT_INGESTION_FAILED`, and embedding-provider errors
+(`AI_PROVIDER_NOT_CONFIGURED`, `EMBEDDING_GENERATION_FAILED`, etc.) if no key is configured or the
+provider fails.
 
-Once a provider has produced its first chunk, the stream is committed to that provider for the
-rest of the answer — a later failure in the same stream is never silently retried against the
-other provider, since that could concatenate two different models' output into what looks like
-one answer. Instead it ends the stream with an `error` event (see the streaming protocol below).
+### `POST /api/chat`
 
-### Streaming protocol
+```json
+{ "documentIds": ["<id>", "..."], "message": "What are the objectives?", "conversationId": "optional" }
+```
 
-`POST /api/chat`'s response is `Content-Type: text/event-stream`, one event per line-pair, in this
-order:
+Rate-limited (10 req/60s per client, best-effort, see [Known Limitations](#known-limitations)).
+Validation/document/conversation failures return an ordinary JSON error *before* the SSE stream
+starts, with the matching status: `400 INVALID_CHAT_REQUEST` / `INVALID_DOCUMENT_ID` /
+`DOCUMENT_SELECTION_LIMIT_EXCEEDED`, `404 DOCUMENT_NOT_FOUND` / `CONVERSATION_NOT_FOUND`,
+`409 DOCUMENT_NOT_READY` / `CONVERSATION_DOCUMENT_CONTEXT_MISMATCH`, `503 AI_PROVIDER_NOT_CONFIGURED`,
+`502 VECTOR_SEARCH_FAILED`, `429 RATE_LIMITED`.
+
+Once streaming starts, the response is `Content-Type: text/event-stream`:
 
 ```
 event: metadata
-data: {"documentId":"...","sources":[{"id":"...","content":"...","pageNumber":1,"chunkIndex":0,"score":0.91}]}
+data: {"conversationId":"...","documentIds":["..."],"sources":[{"id":"...","documentId":"...","documentName":"...","content":"...","pageNumber":1,"chunkIndex":0,"score":0.91}]}
 
 event: delta
-data: {"text":"partial answer text..."}
-
-event: delta
-data: {"text":" more text..."}
+data: {"text":"partial answer..."}
 
 event: done
 data: {}
 ```
 
-or, if generation fails after the stream has already started:
+or, if generation fails mid-stream: `event: error` / `{"code":"LLM_GENERATION_FAILED","message":"..."}`.
 
+### `GET /api/documents`
+
+`?q=<search>&status=processing|ready|failed&page=1&limit=20` (limit capped at 100). Response never
+includes embeddings or chunk content — just what a document picker needs.
+
+### `GET /api/conversations`
+
+`?page=1&limit=20`, sorted by `updatedAt` descending; each summary includes resolved
+`documentNames` (one batched lookup per page, not one query per conversation).
+
+### `POST /api/conversations`
+
+```json
+{ "documentIds": ["<id>", "..."] }
 ```
-event: error
-data: {"code":"LLM_GENERATION_FAILED","message":"Answer generation failed via the gemini provider."}
+
+Creates a conversation with no messages and title `"New conversation"`. Documents are re-validated
+exactly like `/api/chat` (existence, `ready` status, cumulative limits). `201`:
+
+```json
+{ "success": true, "conversation": { "id": "...", "title": "New conversation", "documentIds": ["..."], "createdAt": "...", "updatedAt": "..." } }
 ```
 
-`metadata` is always the first event and always carries the full `sources` array (possibly empty)
-— the client renders sources from this event, not from parsing the answer text. Retrieval/
-validation/configuration failures (bad request, document not found, document not ready, no
-provider configured) are **not** streamed — they're returned as an ordinary JSON error response
-before the stream starts, so the client gets a normal HTTP status code for those cases and only
-needs SSE parsing for the success path. `lib/client/sse.ts` implements the parser (pure, unit
-tested, no network) and `lib/client/api.ts` wires it to `fetch`.
+Errors: `400 INVALID_CREATE_CONVERSATION_REQUEST` / `INVALID_DOCUMENT_ID` /
+`DOCUMENT_SELECTION_LIMIT_EXCEEDED`, `404 DOCUMENT_NOT_FOUND`, `409 DOCUMENT_NOT_READY`.
 
-### Rate limiting
+### `GET /api/conversations/:id` / `DELETE /api/conversations/:id`
 
-`POST /api/chat` applies a best-effort limit of 10 requests per 60 seconds per client IP
-(`lib/utils/rate-limit.ts`), returning `429 RATE_LIMITED` with a `Retry-After` header when
-exceeded. This is an **in-memory, single-process** limiter — it is intentionally not presented as
-a production defense. On Vercel (or any horizontally-scaled deployment) each serverless instance
-keeps its own counters with no shared state, so it only bounds abuse against one warm instance,
-not globally. A real production limit would need a shared store (e.g. Upstash Redis) keyed the
-same way.
+`GET` returns full conversation metadata plus every message, oldest first, with each assistant
+message's `sources`. `DELETE` removes the conversation's messages, then the conversation itself.
+Both: `400 INVALID_CONVERSATION_ID`, `404 CONVERSATION_NOT_FOUND`.
 
-### Manually testing POST /api/chat
+`GET /api/conversations*` and `/api/documents` are read/delete-only, so they're not rate-limited as
+tightly as `/api/chat` (conversations: 60 req/60s; `/api/documents` currently has no rate limit at
+all).
 
-Requires a document already ingested via `POST /api/upload` (see above) and a real Atlas Vector
-Search index configured as described. `-N` disables curl's output buffering so events print as
-they arrive:
+## Environment Variables
+
+Inspected from `lib/config/env.ts` and `.env.example`.
+
+**Required:**
+
+| Variable | Purpose |
+| --- | --- |
+| `MONGODB_URI` | Atlas connection string |
+| `MONGODB_DB_NAME` | Database name |
+
+**At least one required** (both enables automatic fallback):
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` | OpenAI embeddings/generation (fallback) |
+| `GEMINI_API_KEY` | Gemini embeddings/generation (primary) |
+
+**Optional:**
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MONGODB_VECTOR_INDEX` | `chunks_vector_index` | Atlas Vector Search index name |
+| `MONGODB_VECTOR_NUM_CANDIDATES` | `50` | Atlas candidate pool size per query |
+
+No other environment variables are read anywhere in the codebase. Never commit real values — see
+`.env.example` for the placeholder template.
+
+## Local Development
+
+**Prerequisites:** Node.js 20.16.0 (this project intentionally targets that version, not a newer
+one), a MongoDB Atlas cluster, and a Gemini and/or OpenAI API key.
 
 ```bash
-curl -N -X POST http://localhost:3000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"documentIds":["<id from the upload response>"],"message":"What are the objectives of the project?"}'
+git clone https://github.com/IBRINGO/docchat.git
+cd docchat
+npm install
+cp .env.example .env.local   # fill in real values — never commit .env.local
 ```
 
-Add a second id to `documentIds` to chat across multiple documents at once (see "Multi-Document RAG & Conversations" below); add `"conversationId":"<id>"` to continue an existing conversation instead of starting a new one.
+**MongoDB Atlas setup:** create a free/shared cluster, a database user, and allow your IP (or
+`0.0.0.0/0` for local testing) in Network Access. Then create the Atlas Vector Search index
+manually (Atlas UI → your cluster → Search → Create Search Index → JSON editor) using the
+definition under [Vector Search Index](#vector-search-index) above — application code cannot
+create this index itself.
 
-## Why not LangChain/LlamaIndex
+Then initialize the normal (non-vector) indexes once:
 
-Deliberate, not an oversight: the pipeline already has explicit, individually-owned stages —
-extraction, chunking, embedding, retrieval, prompt construction, generation — each a small,
-directly-testable module. At this project's scope, a framework would add an abstraction layer
-without removing any real complexity, and would obscure exactly the decisions this assessment is
-meant to demonstrate: the embedding-compatibility guarantee between ingestion and retrieval, the
-provider-fallback rules (including the "never switch mid-stream" constraint), and the grounding
-strategy. Explicit code here is easier to debug, easier to unit test without network access, and
-keeps every one of those decisions visible and auditable in a handful of files.
-
-## Vercel / serverless readiness
-
-- `app/api/chat/route.ts` and `app/api/upload/route.ts` both declare `export const runtime = "nodejs"` — required, since the MongoDB driver, OpenAI SDK, and `@google/genai` SDK are all Node-only and cannot run on the Edge runtime.
-- MongoDB connections are cached on `global` (`lib/db/mongodb.ts`), reused across warm invocations — unchanged from Day 1.
-- No filesystem writes and no in-memory state required for correctness (the rate limiter is an explicitly best-effort exception, documented above).
-- Streaming uses only standard Web APIs (`ReadableStream`, `Response`), which Vercel's Node.js functions support natively.
-- All server-only dependencies (`mongodb`, `openai`, `@google/genai`, `pdfjs-dist`, `lib/config/env.ts`, every `lib/services/*` and `lib/providers/*` module) are only ever imported from API routes — verified by inspecting the import graph of every client component/hook (`components/`, `hooks/`, `lib/client/`), none of which reach a server-only module.
-- **Deployed to Vercel** (`https://docchat-taupe.vercel.app`) — production PDF uploads initially failed there with `ReferenceError: DOMMatrix is not defined` (see "Production-safe PDF extraction" above for the root cause and fix). That fix was verified via a local production build/start of this exact code and an isolated reproduction of the underlying crash mechanism (see the PR/commit for details) — **an actual redeployment to live Vercel infrastructure to confirm the fix was not performed as part of this change**; that step is still owed before considering this closed.
-
-## Document Library & Multi-Document Selection
-
-`GET /api/documents` lists previously uploaded documents with search, status filtering, and
-pagination:
-
-```
-GET /api/documents?q=report&status=ready&page=1&limit=20
+```bash
+npm run db:indexes
 ```
 
-| Param | Notes |
-| --- | --- |
-| `q` | optional, case-insensitive substring match on filename (regex-escaped — a literal match, never a pattern) |
-| `status` | optional, one of `processing` \| `ready` \| `failed` — the same `DocumentStatus` the rest of the app uses, no parallel status system |
-| `page` / `limit` | optional, default `1`/`20`, `limit` capped at `100` |
+**Run the dev server:**
 
-The response never includes embeddings, chunk content, or embedding provider/model metadata —
-just what a document picker needs (`id`, `fileName`, `mimeType`, `size`, `pageCount`,
-`chunkCount`, `status`, `createdAt`, and `errorMessage` for failed documents only). Sorted
-newest-first, which the existing `documents_createdAt` index already serves — no new index was
-needed for this query shape at the project's scale.
-
-The frontend (`components/documents/`, `hooks/useDocumentLibrary.ts`,
-`hooks/useDocumentSelection.ts`) builds a document library on top of this: search, status tabs,
-and multi-select checkboxes. A document whose status isn't `ready` is rendered disabled and
-cannot be selected — this is enforced both visually and in `canSelectDocument()`
-(`lib/validation/document-selection.ts`), the same predicate that also gates the chat pipeline.
-
-### Why multi-document support does not multiply the original assessment limits
-
-The assessment specifies, per document: native-text PDF, ≤10 MB, ≤~50 pages. Multi-document
-selection is a bonus on top of that scope, not a way around it — so it enforces limits at two
-levels (`lib/config/document-limits.ts`, the single source of truth for both):
-
-1. **Per document (unchanged, now also checks page count):** `validateUploadedFile()` still
-   enforces the 10 MB / PDF-only checks at upload time; `DocumentIngestionService` now also
-   rejects a document over `MAX_DOCUMENT_PAGE_COUNT` (50) right after extraction — before
-   spending anything on chunking or embedding — with `PDF_TOO_MANY_PAGES`.
-2. **Per active selection:** `MAX_ACTIVE_SELECTION_TOTAL_SIZE_BYTES` and
-   `MAX_ACTIVE_SELECTION_TOTAL_PAGES` are **equal to**, not a multiple of, the single-document
-   limits (10 MB / 50 pages total, however many documents that spans). Selecting a second or
-   third document never raises the ceiling — it only lets the same fixed budget be spread across
-   more than one file.
-
-`lib/validation/document-selection.ts` is the framework-independent implementation:
-`validateSelectionLimits(currentSelection, candidate)` returns
-`{ valid, reason?: "MAX_TOTAL_SIZE" | "MAX_TOTAL_PAGES" | "MAX_TOTAL_SIZE_AND_PAGES", totals }`,
-and `toggleDocumentSelection(selectedIds, documentsById, targetId)` uses it to decide whether
-selecting a document is allowed — rejecting the attempt and leaving the existing selection
-untouched otherwise, never landing the user in an over-limit state. It has no React dependency,
-so `hooks/useDocumentSelection.ts` is a thin adapter, and the same functions are directly unit
-tested (`tests/document-selection.test.ts`) and reusable by a future API-side validation pass.
-
-No cap on the *number* of selected documents is enforced yet — the size/page totals are the real
-constraint — but `MAX_ACTIVE_SELECTION_DOCUMENT_COUNT` exists in `document-limits.ts` as an
-explicit, currently-`null` hook so one can be added later without restructuring callers.
-
-## Multi-Document RAG & Conversations
-
-`POST /api/chat` answers from one or more documents in a single request, and persists the
-conversation:
-
-```
-{ documentIds: string[], message: string, conversationId?: string }
+```bash
+npm run dev        # http://localhost:3000
 ```
 
-`documentIds` fully replaces the earlier single-`documentId` contract — a deliberate, one-time
-breaking change (see Part 1 of the task this implements) rather than supporting two parallel
-request shapes indefinitely. A single document is just the `documentIds.length === 1` case; every
-rule below applies uniformly regardless of how many documents are selected. Duplicate IDs in the
-array are silently deduplicated (first-seen order kept), not rejected — an accidental repeat isn't
-a meaningfully different request. All of it is re-validated server-side (valid ObjectIds, every
-document exists and is `"ready"`, the combined selection respects the cumulative size/page limits)
-— the backend never trusts the frontend's own selection UI.
+**Verification commands** (all from `package.json`):
 
-### Embedding configuration grouping
-
-Documents in one request may have been embedded under different configurations — e.g. one via
-Gemini (`gemini-embedding-2`), another via the OpenAI fallback (`text-embedding-3-small`), because
-whichever provider happened to succeed at ingestion time for each one. **Vectors from different
-providers or models are never comparable, even at identical dimensions** — this is the same rule
-enforced for single-document retrieval, just applied per-document now instead of per-request.
-
-`RetrievalService.retrieve()` groups the selected documents by the triple
-`(embeddingProvider, embeddingModel, embeddingDimensions)` before doing anything else:
-
-```
-Group 1 — openai / text-embedding-3-small / 1536:  [Document A, Document C]
-Group 2 — gemini / gemini-embedding-2 / 1536:       [Document B, Document D]
+```bash
+npx tsc --noEmit    # strict TypeScript check
+npm test            # vitest run — unit tests
+npm run lint         # eslint
+npm run build        # production build (Next.js/Turbopack)
+npm run start         # run the production build locally
 ```
 
-For each group, independently: generate ONE query embedding using exactly that group's
-configuration (`EmbeddingService.generateEmbeddingForConfiguration` — never the default
-provider), then run one Atlas `$vectorSearch` scoped to that group's document IDs via a
-`documentId: { $in: [...] }` filter alongside the existing `embeddingProvider`/`embeddingModel`
-filters. This means one Atlas query per *distinct embedding configuration* in the request, not one
-per document — selecting five documents that all share the same configuration still costs exactly
-one query embedding and one vector search call.
+## Testing
 
-### Result merging and ranking
+296 tests across 34 files (`npx vitest run`), all pure unit tests — **no real network, database, or
+LLM/embedding API calls**; external collaborators (MongoDB collections, provider SDK clients) are
+faked via dependency injection (constructor parameters typed as `Pick<RealType, "methodsActuallyUsed">`),
+not `vi.mock`. One file (`tests/prompt.test.ts`) contains only a legacy `it.todo` placeholder —
+`buildRagPrompt` itself is actually covered by `tests/prompt-builder.test.ts` — which is why the
+suite reports "295 passed, 1 todo" across "33 passed, 1 skipped" files.
 
-Each group returns its own top-5 chunks, already sorted by Atlas's `vectorSearchScore`. The merge
-strategy is deliberately simple: concatenate every group's results, sort the combined list by
-score descending, and take the global top 5. No extra per-group rescaling is applied — for the
-cosine similarity metric this app's Atlas index uses, `vectorSearchScore` is normalized by Atlas
-itself onto a fixed 0–1 scale independent of the underlying embedding model, so a straightforward
-global sort is a reasonable, deterministic, and fully explainable merge without inventing a
-weighting scheme with no real evidence behind it. The final result is always bounded to 5 chunks
-regardless of how many documents (or groups) were selected — selecting more documents changes
-*which* chunks compete for those 5 slots, never how many make it into the prompt.
+Covered areas: PDF text extraction and normalization, chunking (boundary selection, overlap,
+Unicode surrogate-pair safety), upload validation, embedding provider clients and
+fallback/configuration logic, LLM provider clients and streaming/fallback logic, prompt
+construction and grounding rules, vector search query construction, multi-document retrieval
+(grouping, per-group embedding, merge/global top-K), chat request validation, the chat
+orchestration service (persistence ordering, error handling, no-context behavior), conversation
+service (creation, title derivation/retitling, document-context matching, message persistence),
+conversation listing/detail/deletion, document listing/selection/validation, the multi-file upload
+queue's pure state machine, SSE frame parsing, and relevance/Markdown display helpers.
 
-**Lightweight lexical re-ranking (bonus) was deliberately not implemented.** Blending in a
-keyword/token-overlap signal on top of vector similarity is a real technique, but adding it here
-would mean inventing and tuning a semantic/lexical weighting scheme with no evaluation data to
-justify any particular weighting — that's exactly the kind of complexity this assessment's
-grounding/compatibility requirements were prioritized over. Semantic-first retrieval via Atlas
-Vector Search remains the sole ranking signal.
+One integration-style test (`tests/document-ingestion.e2e.test.ts`) exercises the *real*
+`extractPdf → normalize → chunk` pipeline end to end against an in-memory synthetic PDF (no
+fixture file, no network) — only the embedding provider and MongoDB collections are faked.
 
-### Grounded multi-document prompt
+**Beyond the automated suite**, prior implementation turns also exercised several endpoints live
+against this project's real MongoDB Atlas cluster and real Gemini API during development (uploads,
+multi-document chat, conversation CRUD, mismatch rejection) — these were manual, ad hoc
+verifications during development, not part of the repeatable `npm test` suite, and are not
+re-run automatically.
 
-`buildRagPrompt()` (unchanged location, `lib/rag/prompt.ts`) labels every `SOURCE [n]` block with
-its originating `Document:` name, and the system prompt explicitly instructs the model to
-attribute claims to the correct document, never claim a document says something it doesn't, and
-mention differences between documents when relevant — on top of the existing single-document
-grounding rules (context-only, no external knowledge, say when the answer isn't supported). This
-is still the *only* place prompt text is constructed; routes and services never build prompt text
-themselves.
+There is no formal evaluation dataset (question/expected-answer pairs) checked into the repository
+— see [Known Limitations](#known-limitations).
 
-### Conversation data model
+## Deployment
 
-Two new collections, `conversations` and `messages` (`types/conversation.ts`,
-`lib/db/collections.ts`):
+Deployed on Vercel at https://docchat-taupe.vercel.app.
 
-```ts
-Conversation { _id, title, documentIds: ObjectId[], createdAt, updatedAt }
-Message { _id, conversationId, role: "user" | "assistant", content, sources: SourceReference[], createdAt }
-```
+- Both `app/api/chat/route.ts` and `app/api/upload/route.ts` (and the other API routes) declare
+  `export const runtime = "nodejs"` — required, since the MongoDB driver, OpenAI SDK, and
+  `@google/genai` SDK are all Node-only and cannot run on Vercel's Edge runtime.
+- Environment variables (`MONGODB_URI`, `MONGODB_DB_NAME`, `GEMINI_API_KEY`/`OPENAI_API_KEY`, and
+  optionally `MONGODB_VECTOR_INDEX`/`MONGODB_VECTOR_NUM_CANDIDATES`) must be configured in the
+  Vercel project settings — they are not read from any file committed to the repository.
+- The Atlas cluster's Network Access list must allow connections from Vercel (either specific
+  egress IPs or, most simply for a project at this scale, `0.0.0.0/0`).
+- MongoDB connections are cached on `global` (`lib/db/mongodb.ts`) and reused across warm
+  serverless invocations.
+- Streaming uses only standard Web APIs (`ReadableStream`, `Response`), which Vercel's Node.js
+  functions support natively — no special Vercel configuration was needed for SSE itself.
+- **Known serverless limitation:** the in-memory rate limiter (see
+  [Known Limitations](#known-limitations)) only bounds one warm instance, not the deployment as a
+  whole, since each serverless instance keeps its own counters.
+- Production PDF uploads initially failed on Vercel with `ReferenceError: DOMMatrix is not
+  defined` — root cause and fix are covered in
+  [Technical Decisions & Trade-offs](#technical-decisions--trade-offs). That fix was verified via a
+  local production build/start and an isolated reproduction of the crash mechanism; it has not yet
+  been confirmed against a fresh live Vercel deployment of the current commit.
 
-`sources` on an assistant message is a denormalized snapshot (`documentId`, `documentName`,
-`chunkId`, `content`, `pageNumber`, `chunkIndex`, `score`) — not a live reference — so conversation
-history keeps displaying correctly even if a source document is later deleted or re-ingested.
-User messages always store `sources: []`.
+## Technical Decisions & Trade-offs
 
-### Conversation/document context rule
+- **MongoDB Atlas + Atlas Vector Search**, not a dedicated vector database — the test specification
+  requires MongoDB Atlas for persistence, and Atlas Vector Search lets document metadata and
+  embeddings live in one system rather than syncing two databases, which is the right trade-off at
+  this project's scale.
+- **No LangChain/LlamaIndex.** The RAG pipeline is small enough that each stage — extraction,
+  chunking, embedding, retrieval, prompt construction, generation — is its own directly-testable
+  module. At this scope, a framework would add an abstraction layer without removing real
+  complexity, and would make several of this project's actual decisions (the
+  embedding-compatibility guarantee between ingestion and retrieval, the "never switch provider
+  mid-stream" rule, per-document-configuration grouping) harder to see and unit-test directly. This
+  isn't a claim that hand-rolled code is better than LangChain/LlamaIndex in general — only that it
+  was the right trade-off for a project this size, where the goal was demonstrating direct control
+  over each RAG stage.
+- **No lexical re-ranking / hybrid search.** Atlas vector similarity retrieval was sufficient for
+  this project's scope. Blending in a keyword/lexical signal is a real, legitimate technique, but
+  doing it well means tuning a semantic/lexical weighting scheme against real evaluation data,
+  which this project doesn't have — adding it without that would mean guessing at weights with no
+  way to validate they're actually better. It's listed as a possible future enhancement, not
+  implemented.
+- **Chunk size 1000 / overlap 200** — a conventional starting point for prose-heavy documents
+  (resumes, reports): large enough that a chunk usually contains a complete thought, small enough
+  to keep the retrieved context focused and the prompt bounded, with enough overlap that a
+  sentence split across a chunk boundary still appears in full in at least one chunk.
+- **`topK = 5`** (per embedding-configuration group *and* as the final global bound) — enough
+  supporting excerpts for most single-fact and light-comparison questions without letting the
+  prompt grow unbounded as more documents are selected.
+- **Embedding configuration is preserved per document** (`embeddingProvider`/`embeddingModel`/
+  `embeddingDimensions` stored on both the document and every one of its chunks) because a query
+  must be embedded with the *exact* configuration a document's chunks were embedded with — OpenAI
+  and Gemini vectors are never comparable, even at equal dimensions, and which provider actually
+  succeeded for a given document depends on runtime fallback behavior, not a fixed default.
+- **A conversation's document set is fixed at creation** — this avoids ever having to reconcile a
+  mid-conversation switch between incompatible document/embedding contexts, and keeps "which
+  documents was this conversation grounded in" an unambiguous, permanent fact rather than a moving
+  target.
+- **SSE (Server-Sent Events), not WebSockets** — the chat interaction is one-directional
+  (server → client) per turn, and SSE runs over a plain HTTP response (`ReadableStream`), which
+  Vercel's Node.js serverless functions support natively with no extra infrastructure.
+- **`/api/upload` (and every other API route) runs on the Node.js runtime, not Edge** — the MongoDB
+  driver, OpenAI SDK, `@google/genai` SDK, and `pdfjs-dist` are all Node-only.
+- **API keys never reach the client** — every provider SDK client, `lib/config/env.ts`, and every
+  `lib/services/*`/`lib/providers/*` module is imported exclusively from API routes; client
+  components/hooks only ever call `fetch` against this app's own routes.
+- **The `DOMMatrix` / `pdfjs-dist` Vercel fix.** `pdfjs-dist`'s Node build unconditionally evaluates
+  canvas-*rendering* module code at import time (a module-top-level `new DOMMatrix()`), even though
+  this app only extracts text (`page.getTextContent()`, never `page.render()`). `DOMMatrix` isn't a
+  real Node global; `pdfjs-dist` tries to self-polyfill it from its optional native `@napi-rs/canvas`
+  dependency, which resolved locally (a Windows binary was installed) but not on Vercel's Linux
+  serverless runtime — so the self-polyfill silently failed there and the later `new DOMMatrix()`
+  threw, crashing the module before the upload handler ever ran. The fix
+  (`lib/pdf/node-polyfills.ts`, imported first in `lib/pdf/extract.ts`) defines `globalThis.DOMMatrix`
+  from `@thednp/dommatrix` — a small, dependency-free, pure-JS, DOMMatrix-API-compatible class,
+  not a native binary, so it behaves identically on every platform. It doesn't implement every
+  method of the real browser `DOMMatrix` (e.g. `invertSelf`), which is fine because this app never
+  calls into `pdfjs-dist`'s actual rendering functions — only real PDF-to-image rendering (not
+  currently a feature of this app) would ever need more than that.
 
-**A conversation's document context is fixed at creation.** Continuing an existing conversation
-(`conversationId` provided) requires the request's `documentIds` to match the conversation's
-stored set exactly, order ignored — otherwise the request is rejected with
-`CONVERSATION_DOCUMENT_CONTEXT_MISMATCH` (409). This is a deliberate simplification: it avoids
-ever having to reconcile a mid-conversation switch between incompatible document/embedding
-contexts, and keeps "which documents was this conversation grounded in" an unambiguous, permanent
-fact. Changing the document selection always means starting a new conversation — the frontend
-(`hooks/useChat.ts`) detects this locally (comparing the active conversation's document set
-against the current selection) and starts fresh automatically rather than sending a request the
-server would reject anyway, showing a small notice first so the switch isn't silent.
+## Bonus Features
 
-### Streaming persistence behavior
+**Implemented:**
 
-`ChatService.prepare()` — which runs to completion *before* the SSE response starts — resolves/
-creates the conversation and persists the user message first, so a conversation only ever exists
-once its triggering message is known to be valid (a request that fails retrieval/validation never
-leaves an orphaned conversation behind). `ChatService.streamAnswer()` then collects the assistant's
-full text internally while forwarding each delta to the client, and persists it as the assistant
-message **only after generation has completed successfully** — a failed or mid-stream-interrupted
-generation is never saved as if it were a complete answer; only an SSE `error` event is sent, and
-the user's message (and any earlier turns) remain in the conversation. If persistence of the
-*already-fully-streamed* assistant message itself fails (e.g. a transient Mongo write error after
-generation succeeded), that failure is logged server-side but does not retroactively turn an
-answer the user already received into an error — the client still gets a normal `done`.
+- Multi-document RAG (selection, per-configuration grouping, merged/ranked retrieval, multi-document
+  grounded prompts).
+- Persistent conversation history (create/list/open/delete, fixed document context, streaming-safe
+  persistence).
+- Rate limiting on `/api/chat` and `/api/conversations*` (best-effort, in-memory — see
+  [Known Limitations](#known-limitations)).
+- Structured logging — every log line is a single JSON object (`level`, `event`, `timestamp`,
+  `context`) via `lib/utils/logger.ts`, used consistently across ingestion, retrieval, chat, and
+  error paths.
+- 296 automated unit tests (see [Testing](#testing)).
+- Multi-file upload with a real progress/status queue.
+- Document library with search, status filtering, and pagination.
+- French support: the grounding prompt explicitly instructs the model to reply in the same
+  language as the question, and the deterministic "not found in the document" fallback answer has
+  a real French variant, selected by a French-language heuristic (`lib/rag/prompt.ts`) — this has
+  been exercised with real French questions against real French documents during development.
 
-The `metadata` SSE event now carries `conversationId` and `documentIds` alongside `sources`, so the
-client can associate the stream with the right conversation from the first event — see the
-Streaming protocol section above for the full event sequence (unchanged otherwise).
+**Not implemented / not verified — stated honestly rather than assumed:**
 
-### Conversation API
+- **Arabic support is not specifically implemented or verified.** The chunker's sentence-boundary
+  regex does include the Arabic question mark (`؟`) as a boundary character alongside Latin
+  punctuation, so chunking is not Latin-only by accident — but there is no Arabic-specific
+  no-context fallback answer, no RTL-specific UI handling, and no verification that
+  `pdfjs-dist`'s text extraction or the LLM's Arabic responses behave correctly against a real
+  Arabic PDF. Any Arabic support that exists is incidental to the underlying LLM's own
+  multilingual capability, not a feature this project specifically built or tested.
+- **Lexical re-ranking / hybrid search** — deliberately not implemented (see
+  [Technical Decisions & Trade-offs](#technical-decisions--trade-offs)).
+- **LangChain / LlamaIndex** — deliberately not used (see
+  [Technical Decisions & Trade-offs](#technical-decisions--trade-offs)).
+- **Evaluation dataset** (a small, checked-in set of questions with expected answers) — not
+  present in this repository.
 
-| Endpoint | Notes |
-| --- | --- |
-| `GET /api/conversations?page=&limit=` | Summaries sorted by `updatedAt` descending — `id`, `title`, `documentIds`, `documentNames` (resolved via one batched lookup across the whole page, not one query per conversation), `createdAt`, `updatedAt` |
-| `GET /api/conversations/:id` | Full conversation metadata plus every message, oldest first, with each assistant message's `sources` |
-| `POST /api/conversations` | `{documentIds: string[]}` → creates a conversation with **no messages yet** and the placeholder title `"New conversation"`. Documents are re-validated server-side exactly like `/api/chat` does (`lib/services/document-selection.service.ts`, shared by both routes — see below) — existence, `"ready"` status, cumulative size/page limits. Returns `201` with `{id, title, documentIds, createdAt, updatedAt}`. |
-| `DELETE /api/conversations/:id` | Deletes the conversation's messages, then the conversation itself |
+## Security
 
-All four are rate-limited the same best-effort way as `/api/chat` (see "Rate limiting" above),
-with a more generous limit since none of them call an LLM.
+- **API keys never leave the server.** `OPENAI_API_KEY`/`GEMINI_API_KEY`/`MONGODB_URI` are read
+  only inside `lib/config/env.ts` and provider/service modules imported exclusively by API routes;
+  no client component or hook imports them, directly or transitively.
+- **Secrets live in environment variables**, not in source — `.env.local` is git-ignored;
+  `.env.example` is a placeholder template only (see the note in
+  [Known Limitations](#known-limitations) about this file's history).
+- **Input validation** on every route: `zod` schemas for JSON bodies and query parameters
+  (`lib/validation/*`), plus file-specific checks (MIME type, extension, PDF magic bytes, size) on
+  upload.
+- **Upload limits are enforced server-side**, never only client-side: 10 MB / 50 pages per
+  document, 10 MB / 50 pages cumulative across an active multi-document selection.
+- **No authentication.** Every document and conversation is visible to any client that can reach
+  the deployed API — there is no login, session, or per-user data isolation. This is explicitly
+  out of scope for this test and is not implemented.
 
-`POST /api/conversations` doesn't replace the normal chat flow — `POST /api/chat` with no
-`conversationId` still creates a conversation implicitly alongside a first message, unchanged. This
-route adds the one path the app didn't have: starting a persisted, selectable conversation *before*
-any message exists, used by the upload flow below. The document-existence/ready/cumulative-limit
-validation previously lived only inside `RetrievalService`; it's now `resolveAndValidateDocuments()`
-in `lib/services/document-selection.service.ts`, and `RetrievalService.retrieve()` was updated to
-call it too — one implementation, not two copies of the same rules.
+## Known Limitations
 
-### Upload-to-conversation flow
+- **No authentication** — see [Security](#security).
+- **Rate limiting is a best-effort, single-instance, in-memory limiter**, not a distributed
+  production defense — on Vercel, each serverless instance keeps its own counters, so it only
+  bounds abuse against one warm instance, not the deployment as a whole. A production system would
+  need a shared store (e.g. Redis).
+- **No OCR** — scanned/image-only PDFs fail with `PDF_TEXT_NOT_EXTRACTABLE`.
+- **No lexical re-ranking / hybrid search** — retrieval is semantic-only via Atlas Vector Search.
+- **No evaluation dataset** checked into the repository.
+- **Arabic support is unverified** — see [Bonus Features](#bonus-features).
+- **`GET /api/documents` has no rate limit**, unlike `/api/chat` and the `/api/conversations*`
+  routes.
+- **The Atlas Vector Search index must be created and maintained manually** — it is not managed by
+  application code.
+- Restoring a conversation whose documents have since scrolled off the currently-loaded/filtered
+  library page won't show them as visually checked until that page loads — cosmetic only; the
+  conversation's real document context, enforced server-side, is unaffected.
+- An in-flight upload can't be cancelled from the UI (retry/remove are only available once an item
+  is no longer in flight).
+- The Markdown-to-plain-text conversion used by the copy-answer button is a small regex-based pass
+  covering the constructs the assistant actually produces, not a full CommonMark converter.
+- The `@thednp/dommatrix` polyfill used for `pdfjs-dist` compatibility (see
+  [Technical Decisions & Trade-offs](#technical-decisions--trade-offs)) implements only enough of
+  the real `DOMMatrix` API for module loading to succeed, not full rendering support — irrelevant
+  today since this app never renders PDFs to canvas, only extracts text.
+- The Vercel DOMMatrix fix has been verified locally (production build/start, plus an isolated
+  reproduction of the crash) but not yet against a fresh live redeployment.
+- `.env.example` previously contained real, working credentials instead of placeholders during
+  development. It was never committed to git (it's covered by `.gitignore`'s `.env*` rule and has
+  no git history) and has since been sanitized to placeholder values — but **the credentials that
+  were in it (a MongoDB user/password and the Gemini/OpenAI API keys used during development)
+  should be rotated** as a precaution, since a file that sat unencrypted on disk outside of git can
+  still leak by other means (backups, screen shares, editor cloud-sync, etc.).
 
-Uploading document(s) automatically starts a new conversation for them, so the user goes from
-"upload" straight to "ask a question" without a manual selection step:
-
-```
-upload batch settles (every file in ONE addFiles() call has succeeded or failed — see
-hooks/useMultiDocumentUpload.ts's onBatchSettled, never fired per-file)
-  → refresh the document library
-  → collect the batch's successfully-uploaded ("ready") document IDs
-  → if none succeeded: stop — no conversation is created
-  → POST /api/conversations with exactly those IDs (server re-validates them)
-  → on success: that document set becomes the active selection, the new (still-empty)
-    conversation becomes the active chat — which switches the UI into "active conversation" mode
-    (see below) — and it appears at the top of the conversation sidebar
-  → on failure (e.g. the combined selection exceeds the cumulative size/page limit): the uploaded
-    documents are left exactly as they are — still uploaded, visible in the library, selectable
-    manually — a clear, non-destructive error explains what happened, and the previously active
-    conversation (if any) is completely untouched
-```
-
-### UI modes: document workspace vs. active conversation
-
-`app/page.tsx` shows exactly one of two modes at a time, derived from a single existing piece of
-state — never a separate flag to keep in sync, and never the conversation's title:
-
-```ts
-isActiveConversationMode(chat.conversationId) // lib/utils/conversation-mode.ts
-```
-
-**Document workspace** (`conversationId === null`) — upload zone, upload queue, document library
-(search/filters/selection), selected-documents summary, and the chat composer once documents are
-selected (to compose a *first* message, which is itself what creates a conversation and flips the
-mode). **Active conversation** (`conversationId !== null`) — just the focused chat: the
-upload/document-selection UI is unmounted entirely, not merely hidden with CSS, so there's nothing
-left behind for a screen reader or keyboard user to stumble into. The conversation sidebar
-(history + "New Conversation") is never conditional on this — it's visible in both modes, on every
-screen size.
-
-A conversation created with no messages yet (`createEmptyConversation`, titled `"New conversation"`)
-counts as fully active the instant it exists — `isActiveConversationMode` takes only a
-`conversationId`, so there's no title parameter for a caller to even accidentally branch on.
-
-"New Conversation" (`ConversationSidebar`'s button → `useChat.startNewChat()`) clears the client's
-`conversationId`/messages — nothing is deleted server-side — which flips the mode back to the
-document workspace; the current document selection is left as-is (matching the existing "New Chat"
-behavior), and every past conversation remains fully intact and reachable from the sidebar.
-Manually selecting existing documents and sending the first message follows the same rule: the mode
-only flips once `POST /api/chat`'s `metadata` event reports a real `conversationId` (the first SSE
-event, arriving before any answer text) — never eagerly on selection alone, so browsing the library
-never creates an orphan conversation.
-
-One upload batch always produces at most one conversation, never one per file — `getBatchResult()`
-(`lib/upload/upload-queue.ts`) splits a batch into its succeeded/failed items only once every item
-in it has reached a terminal state, and a `notifiedBatchesRef` guard in the hook ensures this fires
-exactly once per batch even if a failed file from an already-settled batch is retried afterward.
-Failed uploads are simply excluded from the document set the conversation gets created for.
-
-The freshly-created empty conversation is activated via the same `useChat.loadConversation(id,
-documentIds, [])` restoration path used for reopening any past conversation — with an empty message
-list, since there's nothing to restore yet. Its placeholder title, `"New conversation"`
-(`ConversationService.DEFAULT_CONVERSATION_TITLE`), is deliberately not LLM-generated — the same
-"why" as `deriveConversationTitle` — and is replaced with a real, message-derived title the moment
-the user's first message is persisted to it (`ConversationService.persistUserMessage` →
-`retitleIfPlaceholder`, an atomic `updateOne` filtered on `{_id, title: "New conversation"}`, so it
-only ever fires once and is a guaranteed no-op for every conversation that already has a real
-title). From that point on it's indistinguishable from any other conversation, including in how
-`POST /api/chat` continues it — the document-context-fixed and mismatch-rejection rules described
-above apply to it exactly as they do to an implicitly-created conversation.
-
-### Database indexes
-
-Added to `initializeDatabaseIndexes()` (`lib/db/indexes.ts`, still idempotent, still run manually
-via `npm run db:indexes` — never automatically):
-
-```
-conversations: { updatedAt: -1 }                     — powers GET /api/conversations' sort
-messages:      { conversationId: 1, createdAt: 1 }    — powers ordered message history lookup
-```
-
-### Frontend integration
-
-`hooks/useChat.ts` now owns one active conversation (messages + `conversationId`, previously just
-messages for a single fixed document) and exposes `sendMessage(documentIds, text)`,
-`loadConversation(...)` (restores an existing conversation's messages and document context — used
-both when the sidebar is clicked AND right after an upload-triggered conversation is created, with
-an empty message list in that second case), and `startNewChat()`. `hooks/useDocumentSelection.ts`
-gained `setSelection(ids)` for that same restoration path (bypassing the incremental
-add-one-at-a-time limit check, since a stored conversation's document set was already valid when
-created). `components/conversations/ConversationSidebar.tsx` is new: a "New chat" action plus the
-conversation list, each item showing its title and document names, with delete. The page layout
-(`app/page.tsx`) became two columns on larger screens — the conversation sidebar on the left,
-upload/library/selection/chat stacked in the main column — collapsing to a single stacked column
-on mobile. `app/page.tsx`'s `handleUploadBatchSettled` is the small page-level orchestration
-callback implementing the upload-to-conversation flow above — it composes `useMultiDocumentUpload`,
-`useDocumentLibrary`, `useDocumentSelection`, `useChat`, and `useConversations` rather than any of
-those hooks reaching into each other directly.
-
-### Opening an existing conversation with a stale/filtered document library
-
-Opening a past conversation always loads correctly and restores its real `documentIds`
-server-side, regardless of the document library's current pagination/search/filter state — this
-was already true before this pass (`hooks/useChat.ts`'s `loadConversation` sets the selection
-directly from the conversation's own `documentIds`, not by cross-referencing what's currently
-loaded in the library) and remains the mechanism the upload-to-conversation flow reuses.
-
-## UI/UX Enhancement Pass
-
-A polish pass on top of the working RAG/conversation architecture above — no retrieval, prompt,
-streaming-protocol, persistence, or validation *rule* changed; this section only covers what the
-frontend does with them.
-
-### Multi-file upload
-
-`UploadZone` now accepts any number of PDFs at once (`<input multiple>`, drag-and-drop of multiple
-files). `POST /api/upload` itself is unchanged — still exactly one file per request — so the
-frontend orchestrates the batch: `hooks/useMultiDocumentUpload.ts` uploads queued files **one at a
-time** (a small, safe concurrency strategy, not unlimited parallel requests) via a new
-`uploadDocumentWithProgress()` (`lib/client/api.ts`), which uses `XMLHttpRequest` instead of `fetch`
-specifically to get real upload-progress events.
-
-All the actual queue bookkeeping — which state comes after which, what a retry/remove is allowed to
-do — is pure and framework-free in `lib/upload/upload-queue.ts` (mirroring the existing
-`lib/validation/document-selection.ts` + `hooks/useDocumentSelection.ts` pattern), so it's unit
-tested without touching the DOM, `fetch`, or a network. Each file has an honestly-derived status:
+## Project Structure
 
 ```
-queued → uploading (0-100%, real XHR upload-progress) → processing (request fully sent, awaiting
-the server's extraction/chunking/embedding/persistence — no further client-observable signal until
-the response arrives) → ready | failed
+docchat/
+├── app/
+│   ├── api/
+│   │   ├── upload/                # POST /api/upload
+│   │   ├── chat/                  # POST /api/chat (SSE)
+│   │   ├── documents/             # GET /api/documents
+│   │   └── conversations/         # GET/POST /api/conversations, GET/DELETE /api/conversations/:id
+│   ├── layout.tsx
+│   └── page.tsx                    # Single-page client UI: workspace + active-conversation modes
+├── components/
+│   ├── upload/                     # UploadZone (multi-file), UploadQueueList
+│   ├── documents/                  # DocumentLibrary, selection UI
+│   ├── conversations/              # ConversationSidebar
+│   └── chat/                       # ChatContainer, ChatMessage, MarkdownMessage, SourceCard, ChatInput
+├── hooks/                          # Client-only React state: useChat, useConversations,
+│                                    # useDocumentLibrary, useDocumentSelection, useMultiDocumentUpload
+├── lib/
+│   ├── client/                     # Browser-only fetch/SSE client — no server imports
+│   ├── config/                     # Environment variable validation, document limits
+│   ├── db/                         # Mongo connection, collections, indexes, vector search query
+│   ├── pdf/                        # PDF extraction + normalization (server-only)
+│   ├── rag/                        # Chunking, retrieval types, prompt construction
+│   ├── providers/                  # Embedding + LLM provider abstractions (OpenAI/Gemini)
+│   ├── services/                   # Orchestration: ingestion, embedding, retrieval, answer
+│   │                                # generation, chat, conversations, document selection
+│   ├── upload/                     # Pure upload-queue state machine (framework-free)
+│   ├── validation/                 # Request validation schemas (zod)
+│   └── utils/                      # Errors, structured logging, rate limiting, formatting
+├── types/                          # Shared TypeScript types (Document, Chunk, Conversation, Message)
+└── tests/                          # Vitest unit tests — no network/DB/LLM calls
 ```
 
-An invalid file (wrong extension, over the size limit — checked via
-`lib/validation/upload-client.ts`, which imports the same `MAX_UPLOAD_SIZE_BYTES` the server
-enforces rather than a duplicated literal) is kept in the queue as `failed` with its reason, never
-silently dropped, so a batch with some good and some bad files shows every outcome. A queued item
-can be removed before it starts; a failed item can be retried; an in-flight item cannot be removed
-(the request is still outstanding). After each file finishes, the document library refreshes; the
-current document selection and active conversation are both left untouched, and a newly uploaded
-document is never auto-selected — matching the prior single-file behavior.
+## Future Improvements
 
-### Markdown rendering for assistant answers
+Realistic next steps if this were to continue past the test, roughly in priority order:
 
-Assistant messages are rendered with [`react-markdown`](https://github.com/remarkjs/react-markdown)
-(`components/chat/MarkdownMessage.tsx`) plus `remark-gfm` for tables/strikethrough/task-list syntax
-— the only two dependencies added in this pass. `react-markdown` parses to a React element tree
-rather than `dangerouslySetInnerHTML`, and without the optional `rehype-raw` plugin (deliberately
-not added), any literal HTML the model emits renders as inert text, not markup — safe by default
-with no extra sanitization step needed. Streaming-safe by construction: the full accumulated answer
-is re-parsed on every render, so an incomplete construct (e.g. an unclosed `**`) just displays
-literally for the instant before its closing marker arrives, then self-corrects. Typography is
-hand-written in `app/globals.css` (`.prose-chat`) rather than pulling in `@tailwindcss/typography`,
-since the message bubble only ever needs a bounded set of elements.
-
-### Source relevance presentation
-
-`lib/utils/relevance.ts` turns an Atlas `vectorSearchScore` into a percentage and a restrained
-qualitative label — `Strong match` / `Relevant match` / `Lower match` — deliberately never using the
-word "confidence": it's a similarity ranking signal, not a correctness probability. The thresholds
-(≥0.75 strong, ≥0.5 relevant) are a reasonable display bucketing, not scientifically calibrated, and
-purely presentational — nothing in the retrieval/merge pipeline depends on them. `SourceCard`
-(`components/chat/SourceCard.tsx`) shows the label and percentage as text, not color alone.
-
-### Full chunk preview
-
-Each source card's excerpt can be expanded in place via a "View full source" toggle — an inline
-expandable panel rather than a portal-based popover/modal, which keeps it fully keyboard-accessible
-for free (a plain `<button aria-expanded aria-controls>`, no focus trap or Escape handling to get
-right) and works identically with click/tap on desktop and mobile.
-
-### Honest streaming-stage indicator
-
-While an assistant message is still empty, the UI shows one of two labels — "Searching selected
-documents…" or "Generating response…" — mapped to real, client-observable phases of `POST
-/api/chat`: the first covers everything the server does before its first SSE event (document/context
-resolution and vector search, inside `ChatService.prepare()`); the second covers the gap between
-that `metadata` event and the first `delta` (the LLM's time-to-first-token). No third fabricated
-stage is shown — there is no client-observable boundary between "prompt built" and "generation
-started" to represent honestly.
-
-### Other changes
-
-- **Copy answer**: a small copy button on each completed assistant message, using
-  `navigator.clipboard.writeText()`. It copies a plain-text version of the answer (Markdown
-  formatting characters stripped via `lib/utils/markdown.ts#markdownToPlainText`, a small
-  regex-based pass — not a full parser), not the raw Markdown source, and reports failure instead of
-  failing silently.
-- **Stable scrolling**: the chat pane only auto-scrolls to the newest content when the reader is
-  already near the bottom — scrolling up to review earlier messages is never fought with an
-  automatic jump back down.
-- **Reduced motion**: the small set of custom entrance animations (`app/globals.css`) is disabled
-  under `prefers-reduced-motion: reduce`; everything else already used short (~150–300ms) Tailwind
-  transitions.
-
-## Known limitations
-
-- No OCR — scanned/image-only PDFs fail with `PDF_TEXT_NOT_EXTRACTABLE` at ingestion.
-- No lightweight lexical re-ranking — retrieval is semantic-only via Atlas Vector Search (see "Result merging and ranking" above for why).
-- Restoring an existing conversation restores its document *selection state* correctly, but a document the conversation references that has since scrolled off the currently-loaded/filtered library page won't visually appear checked in the list until it's loaded — a cosmetic edge case, not a data-correctness one (the conversation's real document context, enforced server-side, is unaffected).
-- Rate limiting is a best-effort, single-instance limiter (see below), not a distributed production defense.
-- The Atlas Vector Search index must be created and maintained manually (see above) — it is not managed by application code.
-- The document library's and conversation sidebar's "load more"/single-page pagination have no jump-to-page control — adequate at this project's scale.
-- No authentication — every conversation and document is visible to any client that can reach the API; access control is out of scope for this assessment.
-- An in-flight upload cannot be cancelled from the UI — `uploadDocumentWithProgress()` supports aborting the underlying `XMLHttpRequest`, but the upload queue only exposes remove/retry for items that aren't currently in flight, to avoid hiding an outstanding request from the list that describes it.
-- `markdownToPlainText()` (used by the copy-answer action) is a small regex-based pass covering the Markdown constructs the assistant actually produces (bold/italic, headings, lists, inline/fenced code) — not a full CommonMark-to-text converter; unusual or nested Markdown could copy with minor formatting artifacts.
-- The `@thednp/dommatrix` polyfill (see "Production-safe PDF extraction") only implements enough of the real `DOMMatrix` API for `pdfjs-dist`'s module-evaluation-time code to load; it does not implement every method (e.g. `invertSelf`, `preMultiplySelf`). This is fine today because extraction never calls `pdfjs-dist`'s canvas-rendering functions — only if real PDF-to-image rendering were added later would a genuine canvas backend become necessary.
-- The DOMMatrix fix was verified via a local production build/start and an isolated reproduction of the exact crash mechanism (see "Production-safe PDF extraction" and the Vercel readiness section) — it has not yet been confirmed against a live redeployment of `https://docchat-taupe.vercel.app`.
+- Lexical re-ranking / hybrid search on top of vector retrieval, once there's real evaluation data
+  to tune it against.
+- Authentication and per-user document/conversation isolation.
+- A distributed rate limiter (e.g. Redis-backed) for genuine multi-instance protection.
+- A small, checked-in evaluation dataset (questions + expected answers) to track retrieval/answer
+  quality over time.
+- Verified Arabic (and other RTL) PDF support, end to end.
